@@ -1,0 +1,4 @@
+boto3==1.34.162
+selenium==4.23.1
+pyotp==2.9.0
+awslambdaric==2.0.12
