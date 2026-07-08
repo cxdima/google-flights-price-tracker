@@ -13,6 +13,18 @@ variable "image_uri" {
   default = ""
 }
 
+# Minutes between tracker runs. 15 keeps Lambda comfortably inside the
+# always-free tier (400k GB-s/month); 10 is borderline over it.
+variable "schedule_minutes" {
+  type    = number
+  default = 15
+}
+
+variable "log_retention_days" {
+  type    = number
+  default = 14
+}
+
 variable "google_email" {
   type      = string
   sensitive = true
@@ -37,6 +49,14 @@ variable "telegram_bot_token" {
   default   = ""
 }
 
+# Preferred: "chat_id:Name,chat_id:Name"
+variable "telegram_users" {
+  type      = string
+  sensitive = true
+  default   = ""
+}
+
+# Legacy fallback: comma-separated chat IDs (kept for compatibility)
 variable "telegram_chat_id" {
   type      = string
   sensitive = true

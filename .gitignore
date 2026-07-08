@@ -31,9 +31,6 @@ override.tf.json
 *_override.tf
 *_override.tf.json
 
-# ── Docker ────────────────────────────────────────────────────────────────────
-.dockerignore
-
 # ── AWS ───────────────────────────────────────────────────────────────────────
 /tmp/gfpt_out.json
 /tmp/gfpt_meta.json

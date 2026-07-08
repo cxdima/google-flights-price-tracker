@@ -1,15 +1,25 @@
-.PHONY: deploy test test-unit test-integration help
+.PHONY: help test lint deploy run-local logs
+
+PYTHON ?= .venv/bin/python
+
+help:
+	@echo "make test       Run unit tests (no browser, no AWS)"
+	@echo "make lint       Ruff lint over src/ and tests/"
+	@echo "make deploy     Build, push, and deploy to AWS Lambda"
+	@echo "make run-local  Full pipeline against live Chrome (visible window)"
+	@echo "make logs       Tail the Lambda's CloudWatch logs"
+
+test:
+	@$(PYTHON) -m pytest
+
+lint:
+	@$(PYTHON) -m ruff check src tests
 
 deploy:
 	@bash scripts/deploy.sh
 
-test:
-	@.venv/bin/python -m pytest tests/test_tracker.py tests/test_notifier.py tests/test_auth.py -v
+run-local:
+	@$(PYTHON) scripts/run_local.py
 
-test-integration:
-	@python tests/test_local.py
-
-help:
-	@echo "make deploy           Build, push, and deploy to AWS Lambda"
-	@echo "make test             Run unit tests (no browser required)"
-	@echo "make test-integration Run full end-to-end test with live Chrome"
+logs:
+	@aws logs tail /aws/lambda/$${PROJECT_NAME:-gfpricetracker} --follow --region $${AWS_REGION:-us-east-1}

@@ -1,5 +1,5 @@
-# Build for ARM64 Graviton Lambda:
-#   docker buildx build --platform linux/arm64 -t <tag> --push .
+# Lambda container image (ARM64 Graviton).
+# Built by scripts/deploy.sh:  docker buildx build --platform linux/arm64 ...
 FROM python:3.12-slim-bookworm
 
 # ── System dependencies ────────────────────────────────────────────────────────
@@ -44,15 +44,9 @@ WORKDIR /var/task
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ── Application source ─────────────────────────────────────────────────────────
-COPY config.py   .
-COPY browser.py  .
-COPY auth.py     .
-COPY tracker.py  .
-COPY storage.py  .
-COPY notifier.py .
-COPY handler.py  .
+# ── Application package ────────────────────────────────────────────────────────
+COPY src/gfpt ./gfpt
 
 # ── Lambda runtime ─────────────────────────────────────────────────────────────
 ENTRYPOINT ["python", "-m", "awslambdaric"]
-CMD ["handler.handler"]
+CMD ["gfpt.handler.handler"]

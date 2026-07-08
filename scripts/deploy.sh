@@ -6,7 +6,6 @@ AWS_REGION="${AWS_REGION:-us-east-1}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TF_DIR="${ROOT}/infra"
-APP_DIR="${ROOT}/src"
 ENV_FILE="${ROOT}/.env"
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: $1 not found"; exit 1; }; }
@@ -19,11 +18,6 @@ req_env() {
     exit 1
   fi
 }
-
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  ${PROJECT_NAME} deploy (Lambda + EventBridge, 10-min schedule)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Region : ${AWS_REGION}"
 
 # ---- .env loader ----
 if [[ -f "${ENV_FILE}" ]]; then
@@ -41,7 +35,17 @@ req_env GOOGLE_EMAIL
 req_env GOOGLE_PASSWORD
 req_env TOTP_SECRET
 req_env TELEGRAM_BOT_TOKEN
-req_env TELEGRAM_CHAT_ID
+if [[ -z "${TELEGRAM_USERS:-}" && -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+  echo "ERROR: Set TELEGRAM_USERS (preferred, 'chat_id:Name,...') or TELEGRAM_CHAT_ID in .env"
+  exit 1
+fi
+
+SCHEDULE_MINUTES="${SCHEDULE_MINUTES:-15}"
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  ${PROJECT_NAME} deploy (Lambda + EventBridge, ${SCHEDULE_MINUTES}-min schedule)"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "Region : ${AWS_REGION}"
 
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 echo "Account: ${ACCOUNT_ID}"
@@ -50,11 +54,13 @@ echo "Account: ${ACCOUNT_ID}"
 TF_COMMON_VARS=(
   -var "aws_region=${AWS_REGION}"
   -var "project_name=${PROJECT_NAME}"
+  -var "schedule_minutes=${SCHEDULE_MINUTES}"
   -var "google_email=${GOOGLE_EMAIL}"
   -var "google_password=${GOOGLE_PASSWORD}"
   -var "totp_secret=${TOTP_SECRET}"
   -var "telegram_bot_token=${TELEGRAM_BOT_TOKEN}"
-  -var "telegram_chat_id=${TELEGRAM_CHAT_ID}"
+  -var "telegram_users=${TELEGRAM_USERS:-}"
+  -var "telegram_chat_id=${TELEGRAM_CHAT_ID:-}"
 )
 
 tf() { terraform -chdir="${TF_DIR}" "$@"; }
@@ -117,15 +123,19 @@ tf_import "aws_iam_role_policy_attachment.lambda_app_attach" \
   "${PROJECT_NAME}-lambda-exec/arn:aws:iam::${ACCOUNT_ID}:policy/${PROJECT_NAME}-lambda-app"
 tf_import "aws_s3_bucket_versioning.profile" "${PROJECT_NAME}-profile-${ACCOUNT_ID}"
 tf_import "aws_s3_bucket_lifecycle_configuration.profile" "${PROJECT_NAME}-profile-${ACCOUNT_ID}"
-tf_import "aws_cloudwatch_event_rule.every_10min" "${PROJECT_NAME}-every-10min"
+# Log group is auto-created by Lambda on first run — adopt it so the
+# retention policy applies instead of colliding on create.
+tf_import "aws_cloudwatch_log_group.lambda" "/aws/lambda/${PROJECT_NAME}"
+tf_import "aws_cloudwatch_event_rule.schedule" "${PROJECT_NAME}-schedule"
 
-# Only import Lambda-related resources if they exist in AWS AND Terraform config can "see" them.
-# Because count depends on image_uri, we must pass a non-empty image_uri for import to be valid.
+# Only import Lambda-related resources if they exist in AWS AND Terraform config
+# can "see" them. Because count depends on image_uri, we must pass a non-empty
+# image_uri for import to be valid.
 if [[ -n "${EXISTING_IMAGE_URI}" ]]; then
   tf_import "aws_lambda_function.tracker[0]" "${PROJECT_NAME}" \
     -var "image_uri=${EXISTING_IMAGE_URI}"
 
-  tf_import "aws_cloudwatch_event_target.lambda[0]" "${PROJECT_NAME}-every-10min/lambda" \
+  tf_import "aws_cloudwatch_event_target.lambda[0]" "${PROJECT_NAME}-schedule/lambda" \
     -var "image_uri=${EXISTING_IMAGE_URI}"
 fi
 
@@ -155,22 +165,23 @@ echo "[5] Build & push image ${IMAGE_URI}"
 docker buildx build \
   --platform linux/arm64 \
   --provenance=false \
+  -f "${ROOT}/Dockerfile" \
   -t "${IMAGE_URI}" \
   --push \
-  "${APP_DIR}"
+  "${ROOT}"
 
 echo ""
-echo "[5.5] Import Lambda resources now that config is enabled (image_uri is non-empty)"
+echo "[6] Import Lambda resources now that config is enabled (image_uri is non-empty)"
 if aws lambda get-function --region "${AWS_REGION}" --function-name "${PROJECT_NAME}" >/dev/null 2>&1; then
   tf_import "aws_lambda_function.tracker[0]" "${PROJECT_NAME}" \
     -var "image_uri=${IMAGE_URI}"
 
-  tf_import "aws_cloudwatch_event_target.lambda[0]" "${PROJECT_NAME}-every-10min/lambda" \
+  tf_import "aws_cloudwatch_event_target.lambda[0]" "${PROJECT_NAME}-schedule/lambda" \
     -var "image_uri=${IMAGE_URI}"
 fi
 
 echo ""
-echo "[6] Apply Lambda + schedule"
+echo "[7] Apply Lambda + schedule"
 tf apply -auto-approve -input=false \
   "${TF_COMMON_VARS[@]}" \
   -var "image_uri=${IMAGE_URI}"
@@ -178,14 +189,43 @@ tf apply -auto-approve -input=false \
 LAMBDA_NAME="$(tf output -raw lambda_name)"
 echo "  Lambda: ${LAMBDA_NAME}"
 
+# Remove the legacy v1 schedule rule if it somehow survived (e.g. lost
+# tfstate) — it would double-trigger the tracker alongside the new rule.
+if aws events describe-rule --name "${PROJECT_NAME}-every-10min" --region "${AWS_REGION}" >/dev/null 2>&1; then
+  echo "  Removing legacy schedule rule ${PROJECT_NAME}-every-10min"
+  aws events remove-targets --rule "${PROJECT_NAME}-every-10min" --ids lambda --region "${AWS_REGION}" >/dev/null 2>&1 || true
+  aws events delete-rule --name "${PROJECT_NAME}-every-10min" --region "${AWS_REGION}" >/dev/null 2>&1 || true
+fi
+
 echo ""
-echo "[7] Wait for Lambda update to propagate"
+echo "[8] Wait for Lambda update to propagate"
 aws lambda wait function-updated \
   --region "${AWS_REGION}" \
   --function-name "${LAMBDA_NAME}"
 
+# Webhook is registered BEFORE the test invoke: the new code rejects
+# webhook calls without the secret token, so if this ran last and the test
+# invoke failed, Telegram would keep delivering unsecured (rejected)
+# updates and the bot would be dead until the next successful deploy.
 echo ""
-echo "[8] Test invoke (prints tail logs)"
+echo "[9] Register Telegram webhook (with secret token)"
+WEBHOOK_URL="$(tf output -raw webhook_url)"
+# Must match gfpt/bot/telegram.py:compute_webhook_secret — the Lambda rejects
+# webhook calls without this header.
+WEBHOOK_SECRET="$(python3 -c "import hashlib,os; print(hashlib.sha256(f'gfpt-webhook:{os.environ[\"TELEGRAM_BOT_TOKEN\"]}'.encode()).hexdigest()[:40])")"
+RESPONSE="$(curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
+  --data-urlencode "url=${WEBHOOK_URL}" \
+  --data-urlencode "secret_token=${WEBHOOK_SECRET}" \
+  --data-urlencode 'allowed_updates=["message","edited_message"]')"
+if echo "${RESPONSE}" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get('ok') else 1)"; then
+  echo "  ✓ Webhook set → ${WEBHOOK_URL}"
+else
+  echo "  ✗ setWebhook failed: ${RESPONSE}"
+  exit 1
+fi
+
+echo ""
+echo "[10] Test invoke (prints tail logs)"
 aws lambda invoke \
   --region "${AWS_REGION}" \
   --function-name "${LAMBDA_NAME}" \
@@ -207,16 +247,5 @@ sys.exit(0 if out.get("ok") else 1)
 PY
 
 echo ""
-echo "[9] Register Telegram webhook"
-WEBHOOK_URL="$(tf output -raw webhook_url)"
-RESPONSE="$(curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook?url=${WEBHOOK_URL}")"
-if echo "${RESPONSE}" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get('ok') else 1)"; then
-  echo "  ✓ Webhook set → ${WEBHOOK_URL}"
-else
-  echo "  ✗ setWebhook failed: ${RESPONSE}"
-  exit 1
-fi
-
-echo ""
 echo "DEPLOY COMPLETE"
-echo "CloudWatch Logs: /aws/lambda/${LAMBDA_NAME}"
+echo "CloudWatch Logs: /aws/lambda/${LAMBDA_NAME}  (make logs)"

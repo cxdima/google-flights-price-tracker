@@ -1,44 +1,23 @@
 """
-pytest configuration — path bootstrap, env setup, and shared fixtures.
+pytest configuration — env defaults and shared fixtures.
 
-Loaded automatically by pytest before any test file is collected.
+`pyproject.toml` sets pythonpath=["src"], so `import gfpt.x` works directly;
+no sys.path bootstrap is needed here.
+
+Unit tests must never depend on real credentials: the .env file is NOT
+loaded. Every test runs against the deterministic env below (autouse
+fixture), and the @lru_cache on gfpt.config.load_settings is cleared
+before and after each test so no Settings object leaks between tests.
 """
+from __future__ import annotations
+
 import json
-import os
-import sys
-import urllib.parse
 from unittest.mock import MagicMock
 
 import pytest
+from botocore.exceptions import ClientError
 
-# ── Path bootstrap ─────────────────────────────────────────────────────────────
-# Must happen before any project module is imported.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-
-# ── Load .env (real credentials, used by integration tests) ───────────────────
-_env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
-if os.path.exists(_env_path):
-    with open(_env_path) as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, _, v = line.partition("=")
-                os.environ.setdefault(k.strip(), v.strip())
-
-# ── Minimal stubs so unit tests work even without a .env ──────────────────────
-_UNIT_TEST_DEFAULTS = {
-    "GOOGLE_EMAIL":        "test@example.com",
-    "GOOGLE_PASSWORD":     "test-password",
-    "TOTP_SECRET":         "JBSWY3DPEHPK3PXP",   # well-known test Base32 key
-    "TELEGRAM_BOT_TOKEN":  "0:test-token",
-    "TELEGRAM_CHAT_ID":    "12345",
-    "S3_BUCKET":           "test-bucket",
-    "DYNAMODB_TABLE":      "test-prices",
-    "AWS_REGION":          "us-east-1",
-}
-for _k, _v in _UNIT_TEST_DEFAULTS.items():
-    os.environ.setdefault(_k, _v)
-
+import gfpt.config
 
 # ── Shared constants ───────────────────────────────────────────────────────────
 
@@ -47,26 +26,97 @@ FLIGHT_ID_2 = "id_bbbb2222cccc3333dddd4444eeee5555"   # id_ + 32 lowercase hex
 FLIGHT_ID_SHORT = "TOOSHORT"                           # must be rejected
 SEARCH_URL_1 = "https://www.google.com/travel/flights?tfs=abc123"
 
+CHAT_ID_DMITRY = "12345"
+CHAT_ID_ALEX = "67890"
 
-# ── Fixtures ───────────────────────────────────────────────────────────────────
+_UNIT_TEST_ENV = {
+    "GOOGLE_EMAIL":       "test@example.com",
+    "GOOGLE_PASSWORD":    "test-password",
+    "TOTP_SECRET":        "JBSWY3DPEHPK3PXP",   # well-known test Base32 key
+    "TELEGRAM_BOT_TOKEN": "0:test-token",
+    "TELEGRAM_USERS":     f"{CHAT_ID_DMITRY}:Dmitry,{CHAT_ID_ALEX}:Alex",
+    "S3_BUCKET":          "test-bucket",
+    "DYNAMODB_TABLE":     "test-prices",
+    "AWS_REGION":         "us-east-1",
+}
+
+
+@pytest.fixture(autouse=True)
+def default_env(monkeypatch):
+    """Deterministic settings for every test; cache cleared on both sides."""
+    for key, value in _UNIT_TEST_ENV.items():
+        monkeypatch.setenv(key, value)
+    # Never let a developer's real legacy var leak into tests.
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    gfpt.config.load_settings.cache_clear()
+    yield
+    gfpt.config.load_settings.cache_clear()
+
+
+# ── Fake state store (dict-backed, no AWS) ─────────────────────────────────────
+
+class FakeStateStore:
+    """In-memory stand-in for gfpt.storage.state.StateStore."""
+
+    def __init__(self):
+        self.prefs: dict = {}
+        self.manifest: dict = {}
+        self.summary: dict | None = None
+        self.session: dict | None = None
+        self.streak: int = 0
+
+    def load_user_prefs(self) -> dict:
+        return dict(self.prefs)
+
+    def save_user_prefs(self, prefs: dict) -> bool:
+        self.prefs = dict(prefs)
+        return True
+
+    def load_manifest(self) -> dict:
+        return dict(self.manifest)
+
+    def save_manifest(self, manifest: dict) -> bool:
+        self.manifest = dict(manifest)
+        return True
+
+    def load_summary(self) -> dict | None:
+        return self.summary
+
+    def save_summary(self, summary: dict) -> bool:
+        self.summary = dict(summary)
+        return True
+
+    def load_session(self) -> dict | None:
+        return self.session
+
+    def save_session(self, payload: dict) -> bool:
+        self.session = dict(payload)
+        return True
+
+    def load_failure_streak(self) -> int:
+        return self.streak
+
+    def save_failure_streak(self, count: int) -> bool:
+        self.streak = count
+        return True
+
 
 @pytest.fixture
-def flight_id_1():
-    return FLIGHT_ID_1
+def fake_state():
+    return FakeStateStore()
 
 
-@pytest.fixture
-def flight_id_2():
-    return FLIGHT_ID_2
-
+# ── Price response fixtures ────────────────────────────────────────────────────
 
 @pytest.fixture
 def sample_price_body():
     """
     Realistic fake GetSolutionPrices response.
 
-    Flight 1: price=$450, prev=$500  → price_change=-50, has search URL
-    Flight 2: price=$820, no history → price_change=None
+    Flight 1: price=$450, has a search URL.
+    Flight 2: price=$820, no URL.
+    (Trailing numbers like 500 in flight 1's row mimic the noise the real
+    response carries — the parser must pick the FIRST plausible price.)
     """
     inner = [
         [FLIGHT_ID_1, 450, 500, SEARCH_URL_1],
@@ -79,7 +129,7 @@ def sample_price_body():
 
 @pytest.fixture
 def sample_price_body_no_xsrf():
-    """Same payload but without the XSRF safety prefix."""
+    """Same shape but without the XSRF safety prefix."""
     inner = [[FLIGHT_ID_1, 300]]
     frame = json.dumps(inner)
     outer = [["wrb.fr", "GetSolutionPrices", frame, None, None]]
@@ -89,6 +139,8 @@ def sample_price_body_no_xsrf():
 @pytest.fixture
 def sample_captured_request():
     """Fake CDP-captured GetSolutionPrices POST request dict."""
+    import urllib.parse
+
     f_req = json.dumps([None, [FLIGHT_ID_1], 0])
     post_data = urllib.parse.urlencode({"f.req": f_req, "at": "test_at_token"})
     return {
@@ -102,78 +154,81 @@ def sample_captured_request():
     }
 
 
+# ── Saves-page HTML fixtures ───────────────────────────────────────────────────
+
+def _segment_row(airline, flight_num, origin, dep_date, dep_time,
+                 dest, arr_date, arr_time, duration, via=None):
+    """One journey slice in the positional array format the page uses."""
+    return [
+        None,           # [0]
+        [airline],      # [1] airline
+        [flight_num],   # [2] flight numbers  [["UA", "100"]]
+        origin,         # [3] origin IATA
+        dep_date,       # [4] departure date  [y, m, d]
+        dep_time,       # [5] departure time  [h, m]
+        dest,           # [6] destination IATA
+        arr_date,       # [7] arrival date
+        arr_time,       # [8] arrival time
+        duration,       # [9] duration minutes
+        None,           # [10] padding
+        via,            # [11] stopover airports, or None if direct
+    ]
+
+
+def _page_html_for(flight_id: str, segments: list) -> str:
+    details = [
+        None,                                # [0]
+        "/travel/flights?tfs=abc123",        # [1] search URL
+        None,                                # [2]
+        None,                                # [3]
+        [segments, ["United Airlines"]],     # [4] [[segment_row, ...], [airline]]
+    ]
+    data_array = [None, [[flight_id, details]]]
+    block = json.dumps({"key": "ds:1", "data": data_array})
+    return (
+        "<html><body><script>"
+        f"AF_initDataCallback({block});"
+        "</script></body></html>"
+    )
+
+
 @pytest.fixture
 def sample_page_html():
-    """
-    Minimal saves-page HTML containing one AF_initDataCallback block
-    with a flight entry matching the positional array format that
-    extract_flight_metadata expects.
+    """Saves page with one direct one-way flight: ORD → LAX."""
+    segment = _segment_row(
+        "United Airlines", ["UA", "100"],
+        "ORD", [2026, 4, 1], [8, 30],
+        "LAX", [2026, 4, 1], [11, 45], 195,
+    )
+    return _page_html_for(FLIGHT_ID_1, [segment])
 
-    Structure: [flight_id, details_array] where details_array positions:
-      [1] search URL, [4] [[segment_row, ...], ["Airline"]]
-    Segment row positions:
-      [1] ["Airline"], [2] [["UA","100"]], [3] origin, [4] dep_date,
-      [5] dep_time, [6] dest, [7] arr_date, [8] arr_time, [9] duration,
-      [10] padding, [11] stopovers
-    """
-    segment = [
-        None,                          # [0]
-        ["United Airlines"],           # [1] airline
-        [["UA", "100"]],               # [2] flight numbers
-        "ORD",                         # [3] origin
-        [2026, 4, 1],                  # [4] departure date
-        [8, 30],                       # [5] departure time
-        "LAX",                         # [6] destination
-        [2026, 4, 1],                  # [7] arrival date
-        [11, 45],                      # [8] arrival time
-        195,                           # [9] duration min
-        None,                          # [10]
-        None,                          # [11] stopovers (null = direct)
-    ]
-    details = [
-        None,                                          # [0]
-        "/travel/flights?tfs=abc123",                  # [1] search URL
-        None,                                          # [2]
-        None,                                          # [3]
-        [[segment], ["United Airlines"]],              # [4] segments
-    ]
-    # Wrap in the structure _find_flight_entries expects
-    flight_entry = [FLIGHT_ID_1, details]
-    data_array = [None, [flight_entry]]
 
-    block = json.dumps({"key": "ds:1", "data": data_array})
-    return f'<html><body><script>AF_initDataCallback({block});</script></body></html>'
+@pytest.fixture
+def round_trip_page_html():
+    """Saves page with one round trip: ORD → LAX outbound, LAX → ORD return."""
+    outbound = _segment_row(
+        "United Airlines", ["UA", "100"],
+        "ORD", [2026, 4, 1], [8, 30],
+        "LAX", [2026, 4, 1], [11, 45], 195,
+    )
+    inbound = _segment_row(
+        "United Airlines", ["UA", "205"],
+        "LAX", [2026, 4, 8], [14, 0],
+        "ORD", [2026, 4, 8], [20, 15], 255,
+    )
+    return _page_html_for(FLIGHT_ID_1, [outbound, inbound])
 
+
+# ── AWS mocks ──────────────────────────────────────────────────────────────────
 
 @pytest.fixture
 def mock_s3_empty():
     """S3 client that raises NoSuchKey for every get_object call."""
-    from botocore.exceptions import ClientError
     s3 = MagicMock()
     s3.get_object.side_effect = ClientError(
         {"Error": {"Code": "NoSuchKey", "Message": "Not found"}},
         "GetObject",
     )
-    return s3
-
-
-@pytest.fixture
-def mock_s3_with_session():
-    """S3 client that returns a fresh valid session payload."""
-    from datetime import timezone
-    s3 = MagicMock()
-    payload = json.dumps({
-        "saved_at": datetime.now(timezone.utc).isoformat(),
-        "cookies": [
-            {"name": "SID", "value": "fake-sid", "domain": ".google.com", "path": "/"},
-        ],
-    })
-
-    resp_mock = MagicMock()
-    resp_mock.__getitem__ = lambda self, key: {
-        "Body": MagicMock(read=lambda: payload.encode())
-    }[key]
-    s3.get_object.return_value = {"Body": MagicMock(read=lambda: payload.encode())}
     return s3
 
 
@@ -185,5 +240,9 @@ def mock_dynamodb_table():
     return table
 
 
-# datetime needed in mock_s3_with_session above
-from datetime import datetime
+@pytest.fixture
+def mock_dynamodb_resource(mock_dynamodb_table):
+    """DynamoDB resource whose .Table() returns the mock table."""
+    resource = MagicMock()
+    resource.Table.return_value = mock_dynamodb_table
+    return resource

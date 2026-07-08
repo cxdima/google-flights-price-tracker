@@ -3,9 +3,11 @@ Chrome / Selenium lifecycle management.
 
 Key goals:
   - Stealth: pass Google's bot-detection (JS patches via CDP)
-  - Memory: disable images, cap renderer processes and V8 heap
+  - Memory: disable images, minimal caches — Chrome must fit in Lambda
   - Reliability: nuke leftover processes before each launch
 """
+from __future__ import annotations
+
 import glob
 import logging
 import shutil
@@ -18,7 +20,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service as ChromeService
 
-from config import CHROME_BINARY, CHROMEDRIVER_PATH, CHROME_USER_AGENT
+from gfpt.config import CHROME_USER_AGENT, Settings
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +67,20 @@ window.navigator.permissions.query = (p) =>
     : _origQuery(p);
 """
 
+# Our profile dirs plus Chromium's own /tmp droppings (crashpad, shm
+# fallbacks) — all must be cleaned to stay inside 512 MB ephemeral storage
+# across warm-container runs.
+_TMP_GLOBS = (
+    "/tmp/gfpt-chrome-*",
+    "/tmp/.org.chromium.*",
+    "/tmp/.com.google.Chrome*",
+)
+
+# Fail navigation in-process well before the Lambda hard timeout (120 s)
+# so failures are recorded in the failure streak instead of vanishing.
+_PAGE_LOAD_TIMEOUT_SECS = 60
+_SCRIPT_TIMEOUT_SECS = 30
+
 
 def nuke_chrome() -> None:
     """Kill any leftover Chrome / Chromedriver processes and temp dirs."""
@@ -77,21 +93,24 @@ def nuke_chrome() -> None:
         except Exception:
             pass
 
-    for d in glob.glob("/tmp/gfpt-chrome-*"):
-        try:
-            shutil.rmtree(d, ignore_errors=True)
-        except Exception:
-            pass
+    cleanup_profiles()
 
     # Only sleep if we actually killed something — skip on clean Lambda starts
     if killed:
         time.sleep(0.2)
 
 
-def build_driver() -> webdriver.Chrome:
+def cleanup_profiles() -> None:
+    """Remove Chrome temp dirs from /tmp (frees Lambda ephemeral storage)."""
+    for pattern in _TMP_GLOBS:
+        for path in glob.glob(pattern):
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def build_driver(settings: Settings) -> webdriver.Chrome:
     """
     Launch a headless Chrome instance tuned for Lambda:
-      - Minimal memory footprint (images off, capped renderer + V8 heap)
+      - Minimal memory footprint (images off, tiny disk cache)
       - Stealth fingerprint (CDP JS patches applied before any page loads)
       - Eager page-load strategy (don't wait for every last resource)
     """
@@ -123,8 +142,8 @@ def build_driver() -> webdriver.Chrome:
     #   Eliminates the inter-process "Unable to receive message from renderer"
     #   / "tab crashed" failures that occur in Lambda's container because the
     #   zygote pre-fork or the renderer sandbox cannot initialise cleanly.
-    #   This is safe here: we run exactly one task per invocation with --no-sandbox
-    #   already set, so the isolation trade-off is acceptable.
+    #   This is safe here: we run exactly one task per invocation with
+    #   --no-sandbox already set, so the isolation trade-off is acceptable.
     # --disable-crash-reporter: no crash upload attempts (reduces noise + hangs)
     #
     # NOTE: --no-zygote is intentionally omitted. It breaks JavaScript-based
@@ -140,14 +159,9 @@ def build_driver() -> webdriver.Chrome:
     opts.add_argument("--disable-crash-reporter")
 
     # ── Memory optimisations ──────────────────────────────────────────────────
-    # NOTE: --renderer-process-limit is intentionally omitted.
-    #   Capping to 1 renderer means a single JS crash kills the entire browser
-    #   session (Chrome cannot recover without a spare renderer slot). Google
-    #   Flights is a heavy SPA and will occasionally trigger a renderer OOM.
-    #
-    # NOTE: --js-flags=--max-old-space-size is intentionally omitted.
-    #   256 MB is too small for Google Flights' JS bundle; V8 would OOM and
-    #   crash the renderer, causing the "invalid session id" error.
+    # NOTE: --renderer-process-limit and --js-flags=--max-old-space-size are
+    #   intentionally omitted — both have caused renderer OOM crashes with
+    #   Google Flights' heavy JS bundle (see git history).
     opts.add_argument("--blink-settings=imagesEnabled=false")   # skip image decode
     opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-sync")
@@ -172,19 +186,31 @@ def build_driver() -> webdriver.Chrome:
     opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
     opts.page_load_strategy = "eager"
 
-    opts.binary_location = CHROME_BINARY
+    opts.binary_location = settings.chrome_binary
 
-    service = ChromeService(executable_path=CHROMEDRIVER_PATH)
+    service = ChromeService(executable_path=settings.chromedriver_path)
     driver = webdriver.Chrome(service=service, options=opts)
 
-    _apply_stealth(driver)
+    driver.set_page_load_timeout(_PAGE_LOAD_TIMEOUT_SECS)
+    driver.set_script_timeout(_SCRIPT_TIMEOUT_SECS)
+    apply_stealth(driver)
     log.info("Chrome launched (profile=%s)", profile_dir)
     return driver
 
 
-def _apply_stealth(driver: webdriver.Chrome) -> None:
+def apply_stealth(driver: webdriver.Chrome) -> None:
     """Inject stealth JS so it runs before every page's own scripts."""
     driver.execute_cdp_cmd(
         "Page.addScriptToEvaluateOnNewDocument",
         {"source": _STEALTH_JS},
     )
+
+
+def quit_quietly(driver) -> None:
+    """Shut Chrome down without letting teardown errors mask the real one."""
+    if driver is None:
+        return
+    try:
+        driver.quit()
+    except Exception as exc:
+        log.warning("driver.quit() failed: %s", exc)

@@ -1,0 +1,6 @@
+# Only requirements.txt and src/gfpt are copied into the image —
+# keep everything heavy or secret out of the build context.
+*
+!requirements.txt
+!src/gfpt
+src/gfpt/**/__pycache__
