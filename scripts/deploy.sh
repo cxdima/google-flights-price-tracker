@@ -62,6 +62,10 @@ TF_COMMON_VARS=(
   -var "telegram_users=${TELEGRAM_USERS:-}"
   -var "telegram_chat_id=${TELEGRAM_CHAT_ID:-}"
 )
+# Optional override for the CloudWatch alarm email (defaults in variables.tf)
+if [[ -n "${ALERT_EMAIL:-}" ]]; then
+  TF_COMMON_VARS+=(-var "alert_email=${ALERT_EMAIL}")
+fi
 
 tf() { terraform -chdir="${TF_DIR}" "$@"; }
 

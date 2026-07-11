@@ -34,7 +34,15 @@ def reconcile_manifest(
     flight_meta: dict[str, dict],
     quotes: list[PriceQuote],
     updated_at: str,
+    prune_allowed: bool = True,
 ) -> ReconcileResult:
+    """
+    prune_allowed=False marks this run's view as PARTIAL (a re-fire batch
+    failed, or the metadata parser returned nothing for a non-empty
+    manifest): "absent" is then meaningless, so missing_runs counters are
+    left untouched. Without this, two consecutive partial scrapes — the
+    correlated-failure case — would silently prune live flights.
+    """
     quotes_by_id = {q.flight_id: q for q in quotes}
     seen_ids = set(flight_meta) | set(quotes_by_id)
 
@@ -43,7 +51,7 @@ def reconcile_manifest(
 
     # Nothing seen at all → keep the old manifest untouched (minus timestamp
     # refresh); the runner treats a zero-flight run as a failure anyway.
-    prune_allowed = bool(seen_ids)
+    prune_allowed = prune_allowed and bool(seen_ids)
 
     old_flights = {
         fid: entry for fid, entry in old_manifest.items()

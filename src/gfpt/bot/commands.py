@@ -52,13 +52,23 @@ def handle_update(body: str, ctx: BotContext) -> dict:
     if not text.startswith("/"):
         return {"ok": True, "ignored": True}
 
-    command = text.split()[0].split("@")[0].lower()
+    parts = text.split()
+    command = parts[0].split("@")[0].lower()
+    args = parts[1:]
     log.info("Command %s from %s (%s)", command, user.name, chat_id)
 
     if command == "/status":
         _reply_status(ctx, user)
     elif command == "/flights":
         ctx.client.send_message(chat_id, fmt.format_flights(ctx.state.load_manifest()))
+    elif command == "/settings":
+        _reply_settings(ctx, user)
+    elif command == "/threshold":
+        _handle_threshold(ctx, user, args)
+    elif command == "/rises":
+        _handle_rises(ctx, user, args)
+    elif command in ("/mute", "/unmute"):
+        _handle_route_mute(ctx, user, args, mute=(command == "/mute"))
     elif command == "/pause":
         ctx.registry.set_muted(chat_id, True)
         ctx.client.send_message(
@@ -78,6 +88,96 @@ def handle_update(body: str, ctx: BotContext) -> dict:
 def _reply_status(ctx: BotContext, user) -> None:
     summary = RunSummary.from_dict(ctx.state.load_summary())
     muted = ctx.registry.is_muted(user.chat_id)
+    streak = ctx.state.load_failure_streak()
     ctx.client.send_message(
-        user.chat_id, fmt.format_status(summary, user, muted=muted)
+        user.chat_id,
+        fmt.format_status(summary, user, muted=muted, failure_streak=streak),
+    )
+
+
+def _reply_settings(ctx: BotContext, user) -> None:
+    ctx.client.send_message(
+        user.chat_id,
+        fmt.format_settings(
+            user,
+            muted=ctx.registry.is_muted(user.chat_id),
+            threshold=ctx.registry.alert_threshold(user.chat_id),
+            rises=ctx.registry.wants_rises(user.chat_id),
+            muted_routes=ctx.registry.muted_routes(user.chat_id),
+        ),
+    )
+
+
+def _handle_threshold(ctx: BotContext, user, args: list[str]) -> None:
+    """/threshold        → show current
+       /threshold 25     → only ping for drops ≥ $25
+       /threshold 0|off  → every new low (the default)"""
+    if not args:
+        current = ctx.registry.alert_threshold(user.chat_id)
+        ctx.client.send_message(
+            user.chat_id,
+            f"📉 Your drop threshold: "
+            f"<b>{f'${current:,}' if current else 'every new low'}</b>.\n"
+            "<i>/threshold 25 — only drops of $25+. /threshold 0 — every low.</i>",
+        )
+        return
+    raw = args[0].lstrip("$")
+    if raw.lower() in ("off", "none"):
+        raw = "0"
+    try:
+        value = max(0, int(raw))
+    except ValueError:
+        ctx.client.send_message(
+            user.chat_id, "Usage: <b>/threshold 25</b> (or 0 for every new low)."
+        )
+        return
+    ctx.registry.set_pref(user.chat_id, "threshold", value)
+    ctx.client.send_message(
+        user.chat_id,
+        f"📉 You'll be pinged for drops of <b>${value:,}+</b>."
+        if value else
+        "📉 You'll be pinged on <b>every new low</b> (the default).",
+    )
+
+
+def _handle_rises(ctx: BotContext, user, args: list[str]) -> None:
+    """/rises on|off — opt into rebound-off-the-low pings."""
+    arg = args[0].lower() if args else ""
+    if arg not in ("on", "off"):
+        current = ctx.registry.wants_rises(user.chat_id)
+        ctx.client.send_message(
+            user.chat_id,
+            f"📈 Rebound alerts are <b>{'on' if current else 'off'}</b> for you.\n"
+            "<i>/rises on — get pinged when a price climbs off its low.</i>",
+        )
+        return
+    ctx.registry.set_pref(user.chat_id, "rise_alerts", arg == "on")
+    ctx.client.send_message(
+        user.chat_id,
+        "📈 Rebound alerts <b>on</b> — you'll know when a low starts slipping away."
+        if arg == "on" else
+        "📈 Rebound alerts <b>off</b>.",
+    )
+
+
+def _handle_route_mute(ctx: BotContext, user, args: list[str], mute: bool) -> None:
+    """/mute ORD LAX — silence one route for this user only."""
+    if len(args) != 2 or not all(a.isalpha() and 2 <= len(a) <= 4 for a in args):
+        muted_routes = ctx.registry.muted_routes(user.chat_id)
+        routes = (", ".join(sorted(r.replace("-", " → ") for r in muted_routes))
+                  if muted_routes else "none")
+        ctx.client.send_message(
+            user.chat_id,
+            f"🔇 Your muted routes: <b>{routes}</b>\n"
+            f"<i>Usage: <b>/{'mute' if mute else 'unmute'} ORD LAX</b> "
+            "(origin and destination airport codes).</i>",
+        )
+        return
+    origin, dest = args[0].upper(), args[1].upper()
+    ctx.registry.set_route_muted(user.chat_id, origin, dest, mute)
+    ctx.client.send_message(
+        user.chat_id,
+        f"🔇 <b>{origin} → {dest}</b> muted for you. /unmute {origin} {dest} to undo."
+        if mute else
+        f"🔔 <b>{origin} → {dest}</b> unmuted for you.",
     )

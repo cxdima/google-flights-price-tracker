@@ -1,13 +1,18 @@
 """Unit tests for gfpt.bot.format — pure message builders."""
+from datetime import datetime, timedelta
+
 from conftest import FLIGHT_ID_1, FLIGHT_ID_2, SEARCH_URL_1
 from gfpt.bot.format import (
     _h,
     format_flights,
     format_help,
     format_price_alert,
+    format_price_rise,
     format_removed_flights,
+    format_settings,
     format_status,
 )
+from gfpt.config import TZ
 from gfpt.models import PriceQuote, RunSummary, TelegramUser
 
 USER = TelegramUser(chat_id="12345", name="Dmitry")
@@ -286,3 +291,147 @@ class TestFormatHelp:
 
     def test_greets_user_by_name(self):
         assert "Dmitry" in format_help(USER)
+
+
+def _stamp(minutes_ago: int) -> str:
+    return (datetime.now(TZ) - timedelta(minutes=minutes_ago)).strftime(
+        "%m/%d/%Y %H:%M")
+
+
+class TestStatusStaleness:
+    def test_fresh_run_has_no_banner(self):
+        summary = RunSummary(ok=True, flights=3, finished_at=_stamp(10))
+
+        text = format_status(summary, USER, muted=False)
+
+        assert "Last run was" not in text
+
+    def test_stale_run_shows_loud_banner(self):
+        summary = RunSummary(ok=True, flights=3, finished_at=_stamp(60 * 49))
+
+        text = format_status(summary, USER, muted=False)
+
+        assert "🚨" in text
+        assert "2.0 days ago" in text
+
+    def test_hours_granularity(self):
+        summary = RunSummary(ok=True, flights=3, finished_at=_stamp(150))
+
+        text = format_status(summary, USER, muted=False)
+
+        assert "2.5 hours ago" in text
+
+    def test_unparseable_timestamp_degrades_gracefully(self):
+        summary = RunSummary(ok=True, flights=3, finished_at="whenever")
+
+        text = format_status(summary, USER, muted=False)
+
+        assert "Last run was" not in text
+        assert "whenever" in text
+
+    def test_failure_streak_is_surfaced(self):
+        summary = RunSummary(ok=False, flights=0, error="x",
+                             finished_at=_stamp(5))
+
+        text = format_status(summary, USER, muted=False, failure_streak=4)
+
+        assert "4" in text and "consecutive failed" in text
+
+    def test_zero_streak_not_mentioned(self):
+        summary = RunSummary(ok=True, flights=3, finished_at=_stamp(5))
+
+        text = format_status(summary, USER, muted=False, failure_streak=0)
+
+        assert "consecutive failed" not in text
+
+
+class TestFormatPriceRise:
+    def test_shows_price_low_and_delta(self):
+        quote = PriceQuote(FLIGHT_ID_1, 260, SEARCH_URL_1)
+        meta = {"origin": "ORD", "destination": "LAX"}
+
+        text = format_price_rise(quote, meta, low_price=210)
+
+        assert "$260" in text
+        assert "$210" in text
+        assert "+$50" in text
+        assert "window may be closing" in text
+        assert "ORD → LAX" in text
+
+    def test_survives_missing_low(self):
+        text = format_price_rise(PriceQuote(FLIGHT_ID_1, 260), {}, low_price=None)
+
+        assert "$260" in text
+
+
+class TestFormatAlertPercent:
+    def test_new_low_includes_percent(self):
+        quote = PriceQuote(FLIGHT_ID_1, 450, SEARCH_URL_1)
+
+        text = format_price_alert(quote, {}, is_new_flight=False,
+                                  last_known_price=500)
+
+        assert "−$50" in text
+        assert "−10%" in text
+
+
+class TestFlightsLowPrice:
+    def test_low_price_shown_next_to_current(self):
+        manifest = {FLIGHT_ID_1: {"origin": "ORD", "destination": "LAX",
+                                  "departure_date": "2026-05-08",
+                                  "price": 340, "low_price": 210}}
+
+        text = format_flights(manifest)
+
+        assert "$340" in text
+        assert "low $210" in text
+
+    def test_at_the_low_gets_fire_marker(self):
+        manifest = {FLIGHT_ID_1: {"origin": "ORD", "destination": "LAX",
+                                  "departure_date": "2026-05-08",
+                                  "price": 210, "low_price": 210}}
+
+        text = format_flights(manifest)
+
+        assert "🔥" in text
+        assert "at the low" in text
+
+    def test_return_leg_rendered_for_round_trips(self):
+        manifest = {FLIGHT_ID_1: {
+            "price": 340,
+            "departure_date": "2026-05-08",
+            "origin": "ORD", "destination": "LAX",
+            "departure_time": "08:30", "arrival_time": "11:45",
+            "slices": [
+                {"origin": "ORD", "destination": "LAX",
+                 "departure_date": "2026-05-08",
+                 "departure_time": "08:30", "arrival_time": "11:45"},
+                {"origin": "LAX", "destination": "ORD",
+                 "departure_date": "2026-05-12",
+                 "departure_time": "18:05", "arrival_time": "23:59"},
+            ],
+        }}
+
+        text = format_flights(manifest)
+
+        assert "↩" in text
+        assert "May 12" in text
+        assert "18:05" in text
+
+
+class TestFormatSettings:
+    def test_shows_all_settings(self):
+        text = format_settings(USER, muted=False, threshold=25, rises=True,
+                               muted_routes={"ORD-LAX"})
+
+        assert "$25" in text
+        assert "on" in text
+        assert "ORD → LAX" in text
+
+    def test_defaults_render_meaningfully(self):
+        text = format_settings(USER, muted=False, threshold=0, rises=False,
+                               muted_routes=set())
+
+        assert "every new low" in text
+        assert "off" in text
+        assert "none" in text

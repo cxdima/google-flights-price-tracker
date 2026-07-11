@@ -23,13 +23,39 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from gfpt.config import FLIGHTS_SAVES_URL, SESSION_MAX_AGE_SECS, Settings
+from gfpt.config import (
+    FLIGHTS_SAVES_URL,
+    LOGIN_COOLDOWN_AFTER,
+    LOGIN_RETRY_EVERY_N,
+    SESSION_MAX_AGE_SECS,
+    Settings,
+)
 from gfpt.storage.state import StateStore
 
 if TYPE_CHECKING:
     from selenium import webdriver
 
 log = logging.getLogger(__name__)
+
+
+class LoginFailedError(RuntimeError):
+    """Google refused the login (challenge, CAPTCHA, rejected credentials).
+
+    Raised instead of limping on unauthenticated: the runner counts these
+    separately so repeated failures back off instead of re-running a full
+    password+TOTP login every 15 minutes against the shared account."""
+
+
+# URL fragments that identify a Google login-challenge screen — these mean
+# "Google wants a human", and retrying immediately makes the account look
+# MORE suspicious, not less.
+_CHALLENGE_MARKERS = (
+    "/challenge/",
+    "/signin/rejected",
+    "captcha",
+    "speedbump",
+    "deniedsigninrejected",
+)
 
 # ── Selectors for Google's post-login interstitials ───────────────────────────
 # Google shows passkey creation, phone backup, and recovery prompts after auth.
@@ -68,9 +94,44 @@ def ensure_logged_in(driver: webdriver.Chrome, settings: Settings,
         _try_dismiss_prompt(driver)
         return
 
+    _check_login_cooldown(state)
+
     log.info("No valid session — performing full login")
     do_login(driver, settings, state)
+
+    # Verify on the actual target page: an authenticated session stays on
+    # saves, an unauthenticated one gets redirected back to accounts.
+    driver.get(FLIGHTS_SAVES_URL)
+    if not is_authenticated(driver):
+        _snapshot(driver, state, "login-not-authenticated")
+        raise LoginFailedError(
+            f"login flow completed but Google still refuses the session "
+            f"(landed on {driver.current_url[:80]})"
+        )
+
+    # Only a VERIFIED session is worth caching — persisting unauthenticated
+    # cookies would poison every subsequent run's session restore.
     save_session(driver, state)
+
+
+def _check_login_cooldown(state: StateStore) -> None:
+    """
+    Back off after repeated login failures. The first few failures retry
+    every run (fast recovery from blips); after LOGIN_COOLDOWN_AFTER, only
+    every LOGIN_RETRY_EVERY_N-th run attempts a real login — the rest fail
+    fast without touching Google (the run still counts as failed).
+    """
+    failures = 0
+    try:
+        failures = int(state.load_health().get("login_failures", 0))
+    except (TypeError, ValueError):
+        pass
+    if failures >= LOGIN_COOLDOWN_AFTER and failures % LOGIN_RETRY_EVERY_N != 0:
+        raise LoginFailedError(
+            f"login cooldown: {failures} consecutive login failures — "
+            f"next real attempt in "
+            f"{LOGIN_RETRY_EVERY_N - failures % LOGIN_RETRY_EVERY_N} run(s)"
+        )
 
 
 def save_session(driver: webdriver.Chrome, state: StateStore) -> None:
@@ -253,8 +314,17 @@ def do_login(driver: webdriver.Chrome, settings: Settings,
         )
         log.info("Login: success (redirected to %s)", driver.current_url[:60])
     except TimeoutException:
+        url = driver.current_url
         _snapshot(driver, state, "login-stuck-on-accounts")
-        log.warning("Login: still on accounts page after waiting — continuing anyway")
+        marker = next((m for m in _CHALLENGE_MARKERS if m in url.lower()), None)
+        if marker:
+            raise LoginFailedError(
+                f"Google presented a verification challenge ({marker}) — "
+                "manual sign-in from a trusted device may be needed"
+            ) from None
+        raise LoginFailedError(
+            f"still on accounts.google.com after login flow ({url[:80]})"
+        ) from None
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

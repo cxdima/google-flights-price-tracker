@@ -25,6 +25,14 @@ variable "log_retention_days" {
   default = 14
 }
 
+# Email address for the CloudWatch safety-net alarms (Lambda errors, missed
+# schedules, consecutive scrape failures). The SNS subscription must be
+# confirmed once by clicking the link AWS emails after the first apply.
+variable "alert_email" {
+  type    = string
+  default = "d.moiseenkonl@gmail.com"
+}
+
 variable "google_email" {
   type      = string
   sensitive = true

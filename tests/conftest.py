@@ -63,7 +63,7 @@ class FakeStateStore:
         self.manifest: dict = {}
         self.summary: dict | None = None
         self.session: dict | None = None
-        self.streak: int = 0
+        self.health: dict = {}
 
     def load_user_prefs(self) -> dict:
         return dict(self.prefs)
@@ -94,10 +94,16 @@ class FakeStateStore:
         return True
 
     def load_failure_streak(self) -> int:
-        return self.streak
+        try:
+            return int(self.health.get("consecutive_failures", 0))
+        except (TypeError, ValueError):
+            return 0
 
-    def save_failure_streak(self, count: int) -> bool:
-        self.streak = count
+    def load_health(self) -> dict:
+        return dict(self.health)
+
+    def save_health(self, health: dict) -> bool:
+        self.health = dict(health)
         return True
 
 

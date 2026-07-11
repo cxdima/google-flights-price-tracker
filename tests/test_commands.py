@@ -182,3 +182,87 @@ class TestCommands:
         assert result["command"] == "/frobnicate"
         text = ctx.client.send_message.call_args[0][1]
         assert "/help" in text or "/status" in text
+
+
+class TestSettingsCommands:
+    def test_threshold_set_and_confirm(self, ctx):
+        handle_update(_update(int(CHAT_ID_DMITRY), "/threshold 25"), ctx)
+
+        assert ctx.registry.alert_threshold(CHAT_ID_DMITRY) == 25
+        chat, text = ctx.client.send_message.call_args[0]
+        assert chat == CHAT_ID_DMITRY
+        assert "$25" in text
+
+    def test_threshold_zero_means_every_low(self, ctx):
+        ctx.registry.set_pref(CHAT_ID_DMITRY, "threshold", 25)
+
+        handle_update(_update(int(CHAT_ID_DMITRY), "/threshold 0"), ctx)
+
+        assert ctx.registry.alert_threshold(CHAT_ID_DMITRY) == 0
+        assert "every new low" in ctx.client.send_message.call_args[0][1]
+
+    def test_threshold_garbage_shows_usage_without_change(self, ctx):
+        handle_update(_update(int(CHAT_ID_DMITRY), "/threshold banana"), ctx)
+
+        assert ctx.registry.alert_threshold(CHAT_ID_DMITRY) == 0
+        assert "Usage" in ctx.client.send_message.call_args[0][1]
+
+    def test_rises_on(self, ctx):
+        handle_update(_update(int(CHAT_ID_DMITRY), "/rises on"), ctx)
+
+        assert ctx.registry.wants_rises(CHAT_ID_DMITRY) is True
+
+    def test_rises_off(self, ctx):
+        ctx.registry.set_pref(CHAT_ID_DMITRY, "rise_alerts", True)
+
+        handle_update(_update(int(CHAT_ID_DMITRY), "/rises off"), ctx)
+
+        assert ctx.registry.wants_rises(CHAT_ID_DMITRY) is False
+
+    def test_mute_route(self, ctx):
+        handle_update(_update(int(CHAT_ID_DMITRY), "/mute ORD LAX"), ctx)
+
+        assert ctx.registry.muted_routes(CHAT_ID_DMITRY) == {"ORD-LAX"}
+
+    def test_unmute_route(self, ctx):
+        ctx.registry.set_route_muted(CHAT_ID_DMITRY, "ORD", "LAX", True)
+
+        handle_update(_update(int(CHAT_ID_DMITRY), "/unmute ord lax"), ctx)
+
+        assert ctx.registry.muted_routes(CHAT_ID_DMITRY) == set()
+
+    def test_mute_without_args_lists_routes(self, ctx):
+        ctx.registry.set_route_muted(CHAT_ID_DMITRY, "ORD", "LAX", True)
+
+        handle_update(_update(int(CHAT_ID_DMITRY), "/mute"), ctx)
+
+        text = ctx.client.send_message.call_args[0][1]
+        assert "ORD → LAX" in text
+        assert ctx.registry.muted_routes(CHAT_ID_DMITRY) == {"ORD-LAX"}  # unchanged
+
+    def test_settings_shows_current_state(self, ctx):
+        ctx.registry.set_pref(CHAT_ID_DMITRY, "threshold", 10)
+        ctx.registry.set_pref(CHAT_ID_DMITRY, "rise_alerts", True)
+
+        handle_update(_update(int(CHAT_ID_DMITRY), "/settings"), ctx)
+
+        chat, text = ctx.client.send_message.call_args[0]
+        assert chat == CHAT_ID_DMITRY
+        assert "$10" in text
+        assert "on" in text
+
+    def test_settings_replies_only_to_sender(self, ctx):
+        handle_update(_update(int(CHAT_ID_ALEX), "/settings"), ctx)
+
+        for call in ctx.client.send_message.call_args_list:
+            assert call[0][0] == CHAT_ID_ALEX
+
+    def test_status_surfaces_failure_streak(self, ctx):
+        ctx.state.summary = {"ok": False, "flights": 0, "error": "boom",
+                             "finished_at": "07/09/2026 10:00"}
+        ctx.state.health = {"consecutive_failures": 4}
+
+        handle_update(_update(int(CHAT_ID_DMITRY), "/status"), ctx)
+
+        text = ctx.client.send_message.call_args[0][1]
+        assert "4" in text and "consecutive failed" in text

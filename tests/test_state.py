@@ -126,13 +126,13 @@ class TestWrites:
 
         assert s3.put_object.call_args.kwargs["Key"] == "sessions/latest.json"
 
-    def test_save_failure_streak_writes_counter_shape(self):
+    def test_save_health_writes_dict_shape(self):
         s3 = MagicMock()
 
-        _store(s3).save_failure_streak(3)
+        _store(s3).save_health({"consecutive_failures": 3, "failure_notified": True})
 
         body = json.loads(s3.put_object.call_args.kwargs["Body"])
-        assert body == {"consecutive_failures": 3}
+        assert body == {"consecutive_failures": 3, "failure_notified": True}
 
     def test_write_failure_returns_false_and_does_not_raise(self):
         s3 = MagicMock()
@@ -179,7 +179,7 @@ class TestEmptyBucket:
 
         assert store.save_manifest({}) is False
         assert store.save_session({}) is False
-        assert store.save_failure_streak(1) is False
+        assert store.save_health({"consecutive_failures": 1}) is False
         assert store.save_screenshot("x", b"png") is None
         s3.put_object.assert_not_called()
 
@@ -206,13 +206,16 @@ class TestPriceHistory:
         assert price == 450
         assert isinstance(price, int)
 
-    def test_last_price_returns_none_when_query_raises(
+    def test_last_price_raises_lookup_error_when_query_fails(
         self, mock_dynamodb_resource, mock_dynamodb_table
     ):
+        # "couldn't read" must never look like "never seen" — that would
+        # re-announce an existing flight and reset its low watermark.
         mock_dynamodb_table.query.side_effect = Exception("throttled")
         history = PriceHistory("test-prices", dynamodb=mock_dynamodb_resource)
 
-        assert history.last_price(FLIGHT_ID_1) is None
+        with pytest.raises(LookupError):
+            history.last_price(FLIGHT_ID_1)
 
     def test_record_puts_item_with_core_fields(
         self, mock_dynamodb_resource, mock_dynamodb_table

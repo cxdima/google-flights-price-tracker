@@ -27,9 +27,9 @@ from botocore.exceptions import ClientError
 log = logging.getLogger(__name__)
 
 # S3 error codes that just mean "state not written yet" — normal on first
-# run. AccessDenied is included because GetObject on a MISSING key returns
-# 403 (not 404) when the role lacks s3:ListBucket, as ours deliberately
-# does — but it is logged, since it can also indicate real IAM breakage.
+# run. The role has s3:ListBucket, so a missing key returns a genuine
+# NoSuchKey; AccessDenied therefore indicates real IAM breakage (it would
+# make every read look like a clean state reset), and is logged as an error.
 _MISSING_KEY_CODES = {"NoSuchKey", "NoSuchBucket", "404"}
 _AMBIGUOUS_CODES = {"AccessDenied", "403"}
 
@@ -58,10 +58,10 @@ class StateStore:
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
             if code in _AMBIGUOUS_CODES:
-                log.warning(
-                    "S3 read of %s returned %s — treating as missing key "
-                    "(expected for absent keys without s3:ListBucket, but "
-                    "check IAM if state seems to have reset)", key, code,
+                log.error(
+                    "S3 read of %s returned %s — the role has s3:ListBucket, "
+                    "so this is NOT a missing key: IAM/bucket-policy breakage "
+                    "likely, state may appear reset", key, code,
                 )
             elif code not in _MISSING_KEY_CODES:
                 log.error("S3 read failed for %s: %s", key, exc)
@@ -113,7 +113,8 @@ class StateStore:
         return self._put_json(_SUMMARY_KEY, summary)
 
     # ── Per-user preferences ───────────────────────────────────────────────────
-    # Shape: {chat_id: {"muted": bool}}
+    # Shape: {chat_id: {"muted": bool, "threshold": int, "rise_alerts": bool,
+    #                   "muted_routes": ["ORD-LAX", ...]}}
 
     def load_user_prefs(self) -> dict:
         prefs = self._get_json(_USER_PREFS_KEY, {})
@@ -122,17 +123,22 @@ class StateStore:
     def save_user_prefs(self, prefs: dict) -> bool:
         return self._put_json(_USER_PREFS_KEY, prefs)
 
-    # ── Failure streak ─────────────────────────────────────────────────────────
+    # ── Health (failure streak + notification bookkeeping) ────────────────────
+    # Shape: {"consecutive_failures": int, "failure_notified": bool,
+    #         "login_failures": int}
+
+    def load_health(self) -> dict:
+        health = self._get_json(_HEALTH_KEY, {})
+        return health if isinstance(health, dict) else {}
+
+    def save_health(self, health: dict) -> bool:
+        return self._put_json(_HEALTH_KEY, health)
 
     def load_failure_streak(self) -> int:
-        health = self._get_json(_HEALTH_KEY, {})
         try:
-            return int(health.get("consecutive_failures", 0))
-        except (AttributeError, TypeError, ValueError):
+            return int(self.load_health().get("consecutive_failures", 0))
+        except (TypeError, ValueError):
             return 0
-
-    def save_failure_streak(self, count: int) -> bool:
-        return self._put_json(_HEALTH_KEY, {"consecutive_failures": count})
 
     # ── Crash screenshots ──────────────────────────────────────────────────────
 

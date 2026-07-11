@@ -190,3 +190,28 @@ class TestQuoteMerging:
         entry = result.manifest[FLIGHT_ID_1]
         assert entry["origin"] == "ORD"
         assert entry["price"] == 500  # old price survives when no quote
+
+
+class TestPruneAllowedFlag:
+    def test_partial_run_freezes_missing_counters(self):
+        """prune_allowed=False: absent flights neither advance toward
+        pruning nor get removed — a partial scrape proves nothing."""
+        from gfpt.models import PriceQuote as PQ
+        old = {"id_" + "a" * 32: {"origin": "SFO", "missing_runs": 1}}
+        quote = PQ("id_" + "b" * 32, 300)
+
+        result = reconcile_manifest(old, {}, [quote], updated_at="now",
+                                    prune_allowed=False)
+
+        assert result.removed == {}
+        assert result.manifest["id_" + "a" * 32]["missing_runs"] == 1
+
+    def test_seen_flight_still_resets_counter_on_partial_run(self):
+        from gfpt.models import PriceQuote as PQ
+        fid = "id_" + "a" * 32
+        old = {fid: {"origin": "SFO", "missing_runs": 1}}
+
+        result = reconcile_manifest(old, {}, [PQ(fid, 300)], updated_at="now",
+                                    prune_allowed=False)
+
+        assert result.manifest[fid]["missing_runs"] == 0

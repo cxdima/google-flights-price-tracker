@@ -23,6 +23,12 @@ PRICES_ENDPOINT = "travel.frontend.flights.FlightsFrontendService/GetSolutionPri
 # step without us exiting too early.
 _SILENCE_SECS = 2.5
 
+# On a healthy page the FIRST request appears within seconds; a page that
+# has produced nothing after this long is dead, and polling out the full
+# hydrate window would burn billed seconds and — worse — eat into the
+# Lambda-timeout headroom that failure recording depends on.
+_FIRST_CAPTURE_SECS = 25
+
 # Scroll positions — Google Flights only fires GetSolutionPrices for rows
 # visible in the viewport. Large values are harmless on shorter pages.
 _SCROLL_POSITIONS = [600, 1400, 2500, 4000, 6000, 9000, 14000, 20000]
@@ -56,7 +62,10 @@ def intercept_api_call(
     captured = _poll_for_prices(driver, hydrate_secs)
 
     # Warm-path fallback: if skip_nav captured nothing, the CDP logs were
-    # likely consumed during session restore. Force a page reload.
+    # likely consumed during session restore. Force a page reload — but with
+    # a capped window: two full hydrate polls plus login waits would push a
+    # failing run past the Lambda timeout, where the failure-recording path
+    # can't run.
     if not captured and skip_nav:
         log.warning("Warm path captured nothing — reloading page")
         try:
@@ -64,7 +73,7 @@ def intercept_api_call(
         except Exception:
             pass
         driver.get(FLIGHTS_SAVES_URL)
-        captured = _poll_for_prices(driver, hydrate_secs)
+        captured = _poll_for_prices(driver, min(hydrate_secs, _FIRST_CAPTURE_SECS))
 
     if not captured:
         raise RuntimeError(
@@ -85,12 +94,19 @@ def _poll_for_prices(driver: webdriver.Chrome, hydrate_secs: int) -> list[dict]:
     captured: list[dict] = []
     seen_post_data: set[str] = set()
     last_found_at: float | None = None
-    deadline = time.monotonic() + hydrate_secs
+    start = time.monotonic()
+    deadline = start + hydrate_secs
+    first_capture_deadline = start + min(hydrate_secs, _FIRST_CAPTURE_SECS)
 
     scroll_idx = 0
-    last_scroll_t = time.monotonic()
+    last_scroll_t = start
 
     while time.monotonic() < deadline:
+        # Dead page: nothing at all captured in the first-capture window.
+        if not captured and time.monotonic() >= first_capture_deadline:
+            log.warning("No request captured within %.0fs — aborting poll early",
+                        time.monotonic() - start)
+            break
         found_new = False
         for entry in driver.get_log("performance"):
             try:

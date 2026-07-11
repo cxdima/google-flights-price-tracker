@@ -105,9 +105,11 @@ def format_price_alert(
         lines = [f"✈️ <b>Now tracking</b>  ·  <b>${quote.price:,}</b>"]
     elif last_known_price is not None:
         saved = last_known_price - quote.price
+        pct = round(saved / last_known_price * 100) if last_known_price else 0
+        pct_str = f" · −{pct}%" if pct else ""
         lines = [
             f"📉 <b>New low!</b>  <b>${quote.price:,}</b>"
-            f"  <i>(was ${last_known_price:,}, −${saved:,})</i>"
+            f"  <i>(was ${last_known_price:,}, −${saved:,}{pct_str})</i>"
         ]
     else:
         lines = [f"📉 <b>New low!</b>  <b>${quote.price:,}</b>"]
@@ -140,6 +142,35 @@ def format_price_alert(
     return "\n".join(lines)
 
 
+def format_price_rise(quote: PriceQuote, meta: dict,
+                      low_price: int | None) -> str:
+    """Rebound off the all-time low — the discount window may be closing."""
+    if low_price:
+        risen = quote.price - low_price
+        lines = [
+            f"📈 <b>Rebounding</b>  ·  <b>${quote.price:,}</b>"
+            f"  <i>(was at low ${low_price:,}, +${risen:,})</i>"
+        ]
+    else:
+        lines = [f"📈 <b>Rebounding</b>  ·  <b>${quote.price:,}</b>"]
+
+    route = _route_line(meta)
+    if route:
+        lines.append(f"🛫 <b>{route}</b>")
+    label = _flight_label(meta)
+    if meta.get("flight_numbers"):
+        lines.append(f"<code>{_h(label)}</code>")
+
+    url = quote.search_url or meta.get("search_url")
+    if url:
+        lines.append(f'<a href="{_h(url)}">Open in Google Flights</a>')
+
+    lines.append("<i>The discount window may be closing.</i>")
+    lines.append("")
+    lines.append(f"<i>{_h(_now_stamp())}</i>")
+    return "\n".join(lines)
+
+
 def format_removed_flights(removed: dict) -> str:
     """One combined notice when saved flights disappear from Google Flights."""
     lines = [f"🗑️ <b>No longer tracking</b> ({len(removed)})",
@@ -155,8 +186,31 @@ def format_removed_flights(removed: dict) -> str:
 
 # ── /status ────────────────────────────────────────────────────────────────────
 
+# A run every 15 min means anything older than 3 cycles is an outage, not
+# jitter. /status must never show a reassuring green over a dead tracker.
+_STALE_AFTER_MINS = 45
+
+
+def _staleness_banner(finished_at: str) -> str | None:
+    try:
+        finished = datetime.strptime(finished_at, "%m/%d/%Y %H:%M").replace(tzinfo=TZ)
+    except (ValueError, TypeError):
+        return None
+    age_mins = (datetime.now(TZ) - finished).total_seconds() / 60
+    if age_mins < _STALE_AFTER_MINS:
+        return None
+    age = (f"{age_mins / 1440:.1f} days" if age_mins >= 1440
+           else f"{age_mins / 60:.1f} hours" if age_mins >= 90
+           else f"{age_mins:.0f} min")
+    return (
+        f"🚨 <b>Last run was {age} ago</b> — runs are expected every "
+        "~15 min. The tracker may be down; check CloudWatch."
+    )
+
+
 def format_status(summary: RunSummary | None, user: TelegramUser,
-                  muted: bool, schedule_note: str = "") -> str:
+                  muted: bool, schedule_note: str = "",
+                  failure_streak: int = 0) -> str:
     if summary is None:
         return (
             f"⏳ <b>No run data yet, {_h(user.name)}.</b>\n\n"
@@ -170,18 +224,25 @@ def format_status(summary: RunSummary | None, user: TelegramUser,
     else:
         upd_line = "📊 No price changes this run"
 
-    lines = [
+    lines = []
+    stale = _staleness_banner(summary.finished_at)
+    if stale:
+        lines.extend([stale, ""])
+    lines.extend([
         f"{ok} <b>Price Tracker</b>",
         "━━━━━━━━━━━━━━",
         f"🕐 {_h(summary.finished_at) or '—'}",
         f"✈️ <b>{summary.flights}</b> flights tracked",
         upd_line,
-    ]
+    ])
     if summary.removed:
         lines.append(f"🗑️ {summary.removed} removed")
     lines.append(f"⏱️ {summary.runtime_secs:.0f}s runtime")
     if not summary.ok and summary.error:
         lines.append(f"⚠️ <code>{_h(summary.error[:150])}</code>")
+    if failure_streak:
+        lines.append(f"🔥 <b>{failure_streak}</b> consecutive failed "
+                     f"run{'s' if failure_streak != 1 else ''}")
     if muted:
         lines.append("")
         lines.append("🔕 <i>Your alerts are paused — /resume to re-enable.</i>")
@@ -239,12 +300,28 @@ def format_flights(manifest: dict) -> str:
                 stop_str = ""
 
             price = meta.get("price")
-            price_str = f" · <b>${price:,}</b>" if price else ""
+            low = meta.get("low_price")
+            if price and low and price <= low:
+                price_str = f" · <b>${price:,}</b> 🔥 <i>at the low</i>"
+            elif price and low:
+                price_str = f" · <b>${price:,}</b> <i>(low ${low:,})</i>"
+            elif price:
+                price_str = f" · <b>${price:,}</b>"
+            else:
+                price_str = ""
 
             url = meta.get("search_url", "")
             code = f"<code>{_h(label)}</code>"
             main = f'<a href="{_h(url)}">{code}</a>' if url else code
             lines.append(f"  • {main}  {_h(time_str)}{_h(stop_str)}{price_str}")
+
+            # Round trips: the top-level times mirror the outbound leg only —
+            # show the return so trips differing only by return are tellable
+            # apart without a click-through.
+            for leg in _slices(meta)[1:]:
+                details = _leg_details(leg)
+                if details:
+                    lines.append(f"      ↩ {details}")
         lines.append("")
 
     if pending:
@@ -268,11 +345,34 @@ def format_help(user: TelegramUser) -> str:
         f"👋 <b>Hi {_h(user.name)}!</b>\n\n"
         "<b>/status</b> — last run summary\n"
         "<b>/flights</b> — all monitored flights and prices\n"
+        "<b>/settings</b> — your personal alert settings\n"
+        "<b>/threshold 10</b> — only ping you for drops ≥ $10 "
+        "(<b>/threshold 0</b> = every new low, the default)\n"
+        "<b>/rises on</b> — also ping you when a price rebounds "
+        "off its low (off by default)\n"
+        "<b>/mute ORD LAX</b> — silence one route for you "
+        "(<b>/unmute ORD LAX</b> to undo)\n"
         "<b>/pause</b> — stop <i>your</i> price alerts\n"
         "<b>/resume</b> — re-enable your alerts\n"
         "<b>/help</b> — this message\n\n"
         "<i>Alerts fire automatically whenever a saved flight hits "
-        "a new price low.</i>"
+        "a new all-time low. All settings are yours alone — they never "
+        "affect the other user.</i>"
+    )
+
+
+def format_settings(user: TelegramUser, muted: bool, threshold: int,
+                    rises: bool, muted_routes: set[str]) -> str:
+    routes = (", ".join(sorted(r.replace("-", " → ") for r in muted_routes))
+              if muted_routes else "none")
+    return (
+        f"⚙️ <b>Your settings, {_h(user.name)}</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🔔 Alerts: <b>{'paused' if muted else 'on'}</b>\n"
+        f"📉 Drop threshold: <b>{f'${threshold:,}' if threshold else 'every new low'}</b>\n"
+        f"📈 Rebound alerts: <b>{'on' if rises else 'off'}</b>\n"
+        f"🔇 Muted routes: <b>{_h(routes)}</b>\n\n"
+        "<i>/threshold N · /rises on|off · /mute A B — see /help</i>"
     )
 
 

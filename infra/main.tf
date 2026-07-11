@@ -160,6 +160,14 @@ resource "aws_iam_policy" "lambda_app" {
         Resource = "${aws_s3_bucket.profile.arn}/*"
       },
       {
+        # Without ListBucket, GetObject on a missing key returns 403 instead
+        # of 404 — making a real IAM breakage indistinguishable from normal
+        # first-run state, which once masked a silent state reset.
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = aws_s3_bucket.profile.arn
+      },
+      {
         Effect   = "Allow"
         Action   = ["dynamodb:PutItem", "dynamodb:Query"]
         Resource = aws_dynamodb_table.prices.arn
@@ -226,6 +234,103 @@ resource "aws_lambda_function" "tracker" {
     aws_iam_role_policy_attachment.lambda_app_attach,
     aws_cloudwatch_log_group.lambda,
   ]
+}
+
+# EventBridge invokes the Lambda asynchronously, where AWS defaults to 2
+# hidden retries. A timed-out run would re-launch Chrome (and re-login to
+# Google) up to 3x in quick succession — tripling cost and producing exactly
+# the burst-login pattern that trips Google's anomaly detection. The
+# 15-minute schedule IS the retry mechanism.
+resource "aws_lambda_function_event_invoke_config" "no_retries" {
+  count                        = var.image_uri != "" ? 1 : 0
+  function_name                = aws_lambda_function.tracker[0].function_name
+  maximum_retry_attempts       = 0
+  maximum_event_age_in_seconds = 60
+}
+
+# ── Safety net: external alarms ────────────────────────────────────────────────
+# Every in-app alert (Telegram) requires the tracker code to actually run.
+# These alarms cover the failure modes that produce silence instead: process
+# kills (timeout/OOM), a disabled schedule, and consecutive scrape failures
+# when Telegram itself is the broken part.
+
+resource "aws_sns_topic" "alerts" {
+  name = "${local.name}-alerts"
+}
+
+resource "aws_sns_topic_subscription" "alerts_email" {
+  topic_arn = aws_sns_topic.alerts.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
+# Timeouts, OOM kills, and handler crashes — failures the in-app failure
+# streak can never record because the process dies first.
+resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
+  alarm_name          = "${local.name}-lambda-errors"
+  alarm_description   = "Tracker Lambda reported errors (timeout, OOM, or crash)"
+  namespace           = "AWS/Lambda"
+  metric_name         = "Errors"
+  dimensions          = { FunctionName = local.name }
+  statistic           = "Sum"
+  period              = 900
+  evaluation_periods  = 1
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+}
+
+# Dead-man's-switch: the schedule should produce ~4 invocations/hour. Missing
+# data IS the outage signal (disabled rule, deleted permission, throttled to
+# zero), so it must be treated as breaching.
+resource "aws_cloudwatch_metric_alarm" "lambda_silent" {
+  alarm_name          = "${local.name}-not-running"
+  alarm_description   = "Tracker Lambda has stopped being invoked (schedule dead?)"
+  namespace           = "AWS/Lambda"
+  metric_name         = "Invocations"
+  dimensions          = { FunctionName = local.name }
+  statistic           = "Sum"
+  period              = 3600
+  evaluation_periods  = 2
+  threshold           = 2
+  comparison_operator = "LessThanThreshold"
+  treat_missing_data  = "breaching"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+}
+
+# Caught scrape failures (login rot, parser breakage, S3 write failures) end
+# the run cleanly, so they never hit the Errors metric — but the runner logs
+# a stable "Tracker run failed" line on every caught failure, and the log
+# write does not depend on S3 or Telegram.
+resource "aws_cloudwatch_log_metric_filter" "run_failed" {
+  name           = "${local.name}-run-failed"
+  log_group_name = aws_cloudwatch_log_group.lambda.name
+  pattern        = "\"Tracker run failed\""
+
+  metric_transformation {
+    name          = "RunFailed"
+    namespace     = "GFPT"
+    value         = "1"
+    default_value = "0"
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "runs_failing" {
+  alarm_name          = "${local.name}-runs-failing"
+  alarm_description   = "3+ consecutive tracker runs failed in the last hour"
+  namespace           = "GFPT"
+  metric_name         = "RunFailed"
+  statistic           = "Sum"
+  period              = 3600
+  evaluation_periods  = 1
+  threshold           = 3
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
 }
 
 # ── Schedule ───────────────────────────────────────────────────────────────────

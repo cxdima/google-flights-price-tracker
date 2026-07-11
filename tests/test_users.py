@@ -91,3 +91,60 @@ class TestAlertRecipients:
         registry.set_muted(CHAT_ID_DMITRY, False)
 
         assert registry.alert_recipients() == USERS
+
+
+class TestPersonalSettings:
+    def test_threshold_defaults_to_zero_every_new_low(self, fake_state):
+        assert _registry(fake_state).alert_threshold(CHAT_ID_DMITRY) == 0
+
+    def test_threshold_round_trips(self, fake_state):
+        registry = _registry(fake_state)
+
+        registry.set_pref(CHAT_ID_DMITRY, "threshold", 25)
+
+        assert registry.alert_threshold(CHAT_ID_DMITRY) == 25
+        assert registry.alert_threshold(CHAT_ID_ALEX) == 0  # personal, not shared
+
+    def test_garbage_threshold_degrades_to_zero(self, fake_state):
+        fake_state.prefs = {CHAT_ID_DMITRY: {"threshold": "lots"}}
+
+        assert _registry(fake_state).alert_threshold(CHAT_ID_DMITRY) == 0
+
+    def test_rises_default_off(self, fake_state):
+        assert _registry(fake_state).wants_rises(CHAT_ID_DMITRY) is False
+
+    def test_rises_opt_in_round_trips(self, fake_state):
+        registry = _registry(fake_state)
+
+        registry.set_pref(CHAT_ID_DMITRY, "rise_alerts", True)
+
+        assert registry.wants_rises(CHAT_ID_DMITRY) is True
+        assert registry.rise_recipients() == (USERS[0],)
+
+    def test_rise_recipients_excludes_muted_users(self, fake_state):
+        registry = _registry(fake_state)
+        registry.set_pref(CHAT_ID_DMITRY, "rise_alerts", True)
+        registry.set_muted(CHAT_ID_DMITRY, True)
+
+        assert registry.rise_recipients() == ()
+
+
+class TestRouteMutes:
+    def test_no_routes_muted_by_default(self, fake_state):
+        assert _registry(fake_state).muted_routes(CHAT_ID_DMITRY) == set()
+
+    def test_mute_and_unmute_route(self, fake_state):
+        registry = _registry(fake_state)
+
+        registry.set_route_muted(CHAT_ID_DMITRY, "ord", "lax", True)
+        assert registry.muted_routes(CHAT_ID_DMITRY) == {"ORD-LAX"}
+
+        registry.set_route_muted(CHAT_ID_DMITRY, "ORD", "LAX", False)
+        assert registry.muted_routes(CHAT_ID_DMITRY) == set()
+
+    def test_route_mutes_are_per_user(self, fake_state):
+        registry = _registry(fake_state)
+
+        registry.set_route_muted(CHAT_ID_DMITRY, "ORD", "LAX", True)
+
+        assert registry.muted_routes(CHAT_ID_ALEX) == set()

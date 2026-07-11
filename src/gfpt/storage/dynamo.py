@@ -32,18 +32,25 @@ class PriceHistory:
         self._table = resource.Table(table_name)
 
     def last_price(self, flight_id: str) -> int | None:
-        """Return the most recently recorded price for a flight, or None."""
+        """
+        Return the most recently recorded price for a flight, or None if the
+        flight has no history.
+
+        Raises LookupError on a failed read: "couldn't read" must never look
+        like "never seen" — that would re-announce an existing flight and
+        reset its low-price watermark to whatever today's price is.
+        """
         try:
             resp = self._table.query(
                 KeyConditionExpression=Key("flight_id").eq(flight_id),
                 ScanIndexForward=False,
                 Limit=1,
             )
-            items = resp.get("Items", [])
-            return int(items[0]["price"]) if items else None
         except Exception as exc:
             log.error("DynamoDB last_price failed for %s: %s", flight_id[:16], exc)
-            return None
+            raise LookupError(f"price history read failed: {exc}") from exc
+        items = resp.get("Items", [])
+        return int(items[0]["price"]) if items else None
 
     def record(self, quote: PriceQuote, meta: dict | None = None,
                prev_price: int | None = None) -> bool:

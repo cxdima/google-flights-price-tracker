@@ -38,6 +38,14 @@ MISSING_RUNS_BEFORE_REMOVAL = 2
 # Notify users after this many consecutive failed runs (not on every failure)
 FAILURE_NOTIFY_THRESHOLD = 3
 
+# After this many consecutive LOGIN failures (challenge/CAPTCHA screens),
+# stop hammering Google every run...
+LOGIN_COOLDOWN_AFTER = 3
+# ...and only re-attempt a real login every Nth run (4 × 15 min ≈ hourly).
+# 96 password+TOTP logins/day against one shared account is exactly the
+# pattern that gets it locked.
+LOGIN_RETRY_EVERY_N = 4
+
 TZ = ZoneInfo("America/Chicago")
 
 

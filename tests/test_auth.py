@@ -202,3 +202,46 @@ class TestSaveSession:
         state.save_session.return_value = False
 
         save_session(d, state)  # must not raise
+
+
+# ── Login cooldown ─────────────────────────────────────────────────────────────
+
+import pytest  # noqa: E402
+
+from gfpt.config import LOGIN_COOLDOWN_AFTER, LOGIN_RETRY_EVERY_N  # noqa: E402
+from gfpt.tracking.auth import LoginFailedError, _check_login_cooldown  # noqa: E402
+
+
+def _state_with_login_failures(count):
+    state = MagicMock()
+    state.load_health.return_value = {"login_failures": count}
+    return state
+
+
+class TestLoginCooldown:
+    def test_no_cooldown_with_zero_failures(self):
+        _check_login_cooldown(_state_with_login_failures(0))  # no raise
+
+    def test_no_cooldown_below_threshold(self):
+        _check_login_cooldown(
+            _state_with_login_failures(LOGIN_COOLDOWN_AFTER - 1))
+
+    def test_cooldown_kicks_in_at_threshold(self):
+        with pytest.raises(LoginFailedError, match="cooldown"):
+            _check_login_cooldown(
+                _state_with_login_failures(LOGIN_COOLDOWN_AFTER))
+
+    def test_every_nth_run_attempts_a_real_login(self):
+        _check_login_cooldown(
+            _state_with_login_failures(LOGIN_RETRY_EVERY_N))  # no raise
+
+    def test_runs_between_retry_windows_fail_fast(self):
+        with pytest.raises(LoginFailedError):
+            _check_login_cooldown(
+                _state_with_login_failures(LOGIN_RETRY_EVERY_N + 1))
+
+    def test_garbage_counter_means_no_cooldown(self):
+        state = MagicMock()
+        state.load_health.return_value = {"login_failures": "many"}
+
+        _check_login_cooldown(state)  # no raise
