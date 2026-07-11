@@ -25,6 +25,14 @@ variable "log_retention_days" {
   default = 14
 }
 
+# Launch Chrome only every Nth run; runs between refire the saved price
+# requests without a browser (~10s instead of ~60-90s of billed time).
+# 1 = Chrome every run (the pre-refire behavior).
+variable "browser_every_n" {
+  type    = number
+  default = 1
+}
+
 # Email address for the CloudWatch safety-net alarms (Lambda errors, missed
 # schedules, consecutive scrape failures). The SNS subscription must be
 # confirmed once by clicking the link AWS emails after the first apply.

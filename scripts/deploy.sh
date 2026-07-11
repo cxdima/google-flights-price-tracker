@@ -66,6 +66,10 @@ TF_COMMON_VARS=(
 if [[ -n "${ALERT_EMAIL:-}" ]]; then
   TF_COMMON_VARS+=(-var "alert_email=${ALERT_EMAIL}")
 fi
+# Chrome-less refire cadence (1 = browser every run; see variables.tf)
+if [[ -n "${BROWSER_EVERY_N:-}" ]]; then
+  TF_COMMON_VARS+=(-var "browser_every_n=${BROWSER_EVERY_N}")
+fi
 
 tf() { terraform -chdir="${TF_DIR}" "$@"; }
 

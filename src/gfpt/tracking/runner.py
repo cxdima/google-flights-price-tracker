@@ -27,7 +27,12 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from gfpt.bot.notifier import Notifier
-from gfpt.config import FAILURE_NOTIFY_THRESHOLD, TZ, Settings
+from gfpt.config import (
+    FAILURE_NOTIFY_THRESHOLD,
+    REFIRE_MAX_AGE_SECS,
+    TZ,
+    Settings,
+)
 from gfpt.models import PriceQuote, RunSummary
 from gfpt.storage.dynamo import PriceHistory
 from gfpt.storage.state import StateStore
@@ -92,7 +97,7 @@ def run_and_report(deps: TrackerDeps) -> dict:
     deps.state.save_health({**health, "consecutive_failures": streak})
 
     try:
-        summary = _run(deps, t0)
+        summary = _run(deps, t0, health)
     except Exception as exc:
         log.error("Tracker run failed: %s\n%s", exc, traceback.format_exc())
         summary = RunSummary(
@@ -118,27 +123,57 @@ def run_and_report(deps: TrackerDeps) -> dict:
         return summary.to_dict()
 
     deps.state.save_summary(summary.to_dict())
-    deps.state.save_health(
-        {"consecutive_failures": 0, "failure_notified": False, "login_failures": 0}
+    runs_since_browser = (
+        0 if summary.mode == "browser"
+        else _as_int(health.get("runs_since_browser")) + 1
     )
+    deps.state.save_health({
+        "consecutive_failures": 0,
+        "failure_notified": False,
+        "login_failures": 0,
+        "runs_since_browser": runs_since_browser,
+    })
     if health.get("failure_notified"):
         deps.notifier.recovery(prev_streak)
     log.info("GFPT_SUMMARY %s", json.dumps(summary.to_dict()))
     return summary.to_dict()
 
 
-def _run(deps: TrackerDeps, t0: float) -> RunSummary:
-    captured, page_html, headers = _browser_phase(deps.settings, deps.state)
-    log.info("Chrome released at %.1fs", time.monotonic() - t0)
+def _run(deps: TrackerDeps, t0: float, health: dict) -> RunSummary:
+    mode = "browser"
+    flight_meta: dict = {}
+    quotes: list[PriceQuote] = []
+    refire_failures = 0
 
-    flight_meta = extract_flight_metadata(page_html)
-    del page_html  # free the multi-MB HTML string
+    # Chrome-less run: refire the saved requests with the saved headers.
+    # Any doubt (no saved state, stale, zero quotes) falls back to a full
+    # browser run in the same invocation — refire can degrade, never break.
+    saved = _usable_refire_state(deps, health)
+    if saved is not None:
+        quotes, refire_failures = _fetch_quotes(saved["captured"], saved["headers"])
+        if quotes:
+            mode = "refire"
+            log.info("Refire-only run: %d quote(s), no Chrome", len(quotes))
+        else:
+            log.warning("Refire-only run got no quotes — falling back to browser")
 
-    quotes, refire_failures = _fetch_quotes(captured, headers)
-    log.info("Parsed %d price quote(s) from %d request(s), %d re-fire failure(s)",
-             len(quotes), len(captured), refire_failures)
     if not quotes:
-        raise RuntimeError("No price quotes parsed from captured requests")
+        captured, page_html, headers = _browser_phase(deps.settings, deps.state)
+        log.info("Chrome released at %.1fs", time.monotonic() - t0)
+
+        flight_meta = extract_flight_metadata(page_html)
+        del page_html  # free the multi-MB HTML string
+
+        quotes, refire_failures = _fetch_quotes(captured, headers)
+        log.info("Parsed %d price quote(s) from %d request(s), %d re-fire failure(s)",
+                 len(quotes), len(captured), refire_failures)
+        if not quotes:
+            raise RuntimeError("No price quotes parsed from captured requests")
+        deps.state.save_refire({
+            "saved_at": time.time(),
+            "captured": captured,
+            "headers": headers,
+        })
 
     old_manifest = deps.state.load_manifest()
     prev_quoted = {
@@ -181,7 +216,29 @@ def _run(deps: TrackerDeps, t0: float) -> RunSummary:
         removed=len(result.removed),
         runtime_secs=time.monotonic() - t0,
         finished_at=_now_str(),
+        mode=mode,
     )
+
+
+def _usable_refire_state(deps: TrackerDeps, health: dict) -> dict | None:
+    """Saved refire state, iff this run is scheduled to skip Chrome and the
+    state is fresh enough to trust. None means: run the browser."""
+    n = deps.settings.browser_every_n
+    if n <= 1:
+        return None
+    if _as_int(health.get("runs_since_browser")) + 1 >= n:
+        return None  # this is the scheduled browser run
+    saved = deps.state.load_refire()
+    if not isinstance(saved, dict) or not saved.get("captured"):
+        return None
+    try:
+        age = time.time() - float(saved["saved_at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if age > REFIRE_MAX_AGE_SECS:
+        log.info("Refire state is %.0f min old — running browser instead", age / 60)
+        return None
+    return saved
 
 
 # ── Phase 1: browser ───────────────────────────────────────────────────────────

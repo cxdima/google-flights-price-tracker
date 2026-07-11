@@ -31,6 +31,13 @@ CHROME_USER_AGENT = (
 # Maximum age of a cached Google session before we force a fresh login
 SESSION_MAX_AGE_SECS = 6 * 60 * 60
 
+# Maximum age of saved refire state (captured requests + session headers)
+# before a Chrome-less run refuses it and falls back to the browser.
+# Measured 2026-07-10: refires were VALID at +15 min but DEAD at +30 min
+# (Google rejects the token/cookies), so N=2 is the ceiling on a 15-min
+# schedule; 25 min covers schedule jitter without trusting dead tokens.
+REFIRE_MAX_AGE_SECS = 25 * 60
+
 # A flight must be absent from this many consecutive runs before it is
 # pruned from the manifest — protects against one bad scrape wiping the list.
 MISSING_RUNS_BEFORE_REMOVAL = 2
@@ -69,6 +76,9 @@ class Settings:
     chromedriver_path: str
     # Seconds to wait for GetSolutionPrices network calls after page load
     hydrate_secs: int
+    # Launch Chrome only every Nth run; the runs between refire the saved
+    # requests without a browser (1 = Chrome every run)
+    browser_every_n: int
 
 
 def parse_telegram_users(users_raw: str, chat_ids_raw: str) -> tuple[TelegramUser, ...]:
@@ -119,4 +129,5 @@ def load_settings() -> Settings:
         chrome_binary=env("CHROME_BINARY", "/usr/bin/chromium"),
         chromedriver_path=env("CHROMEDRIVER_PATH", "/usr/bin/chromedriver"),
         hydrate_secs=int(env("HYDRATE_SECS", "45")),
+        browser_every_n=max(1, int(env("BROWSER_EVERY_N", "1"))),
     )

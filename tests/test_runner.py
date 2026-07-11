@@ -19,15 +19,18 @@ def deps():
     state = MagicMock()
     state.load_manifest.return_value = {}
     state.load_health.return_value = {}
+    state.load_refire.return_value = None
     state.save_manifest.return_value = True
     state.save_health.return_value = True
     state.save_summary.return_value = True
+    settings = MagicMock()
+    settings.browser_every_n = 1
     history = MagicMock()
     history.last_price.return_value = None
     notifier = MagicMock()
     notifier.failure.return_value = True
     return TrackerDeps(
-        settings=MagicMock(),
+        settings=settings,
         state=state,
         history=history,
         notifier=notifier,
@@ -449,3 +452,103 @@ class TestReboundDamping:
         manifest = deps.state.save_manifest.call_args[0][0]
         assert manifest[FLIGHT_ID_1]["low_price"] == 500
         deps.notifier.price_alert.assert_not_called()  # unchanged: no alert
+
+
+# ── Refire mode (BROWSER_EVERY_N) ──────────────────────────────────────────────
+
+import time as _time  # noqa: E402
+
+
+def _fresh_refire_state():
+    return {"saved_at": _time.time(),
+            "captured": [{"url": "saved-req"}], "headers": {"Cookie": "x"}}
+
+
+class TestRefireMode:
+    def _wire_refire(self, deps, monkeypatch, refire_quotes, browser_quotes=None):
+        """Refire path returns refire_quotes; the browser path (if reached)
+        returns browser_quotes."""
+        deps.settings.browser_every_n = 3
+        deps.state.load_refire.return_value = _fresh_refire_state()
+        browser_quotes = browser_quotes or [PriceQuote(FLIGHT_ID_1, 450, SEARCH_URL_1)]
+        monkeypatch.setattr(
+            runner_mod, "_browser_phase",
+            lambda settings, state: ([{"url": "browser-req"}], "<html/>", {"Cookie": "y"}),
+        )
+        monkeypatch.setattr(runner_mod, "extract_flight_metadata",
+                            lambda html: {FLIGHT_ID_1: {"origin": "ORD"}})
+
+        def fetch(captured, headers):
+            if captured and captured[0].get("url") == "saved-req":
+                return refire_quotes, 0
+            return browser_quotes, 0
+
+        monkeypatch.setattr(runner_mod, "_fetch_quotes", fetch)
+
+    def test_default_n1_never_touches_refire_state(self, deps, monkeypatch):
+        _wire_success(monkeypatch)
+
+        result = run_and_report(deps)
+
+        deps.state.load_refire.assert_not_called()
+        assert result["mode"] == "browser"
+
+    def test_refire_run_skips_browser(self, deps, monkeypatch):
+        self._wire_refire(deps, monkeypatch,
+                          refire_quotes=[PriceQuote(FLIGHT_ID_1, 450)])
+        monkeypatch.setattr(runner_mod, "_browser_phase",
+                            lambda s, st: pytest.fail("browser must not launch"))
+
+        result = run_and_report(deps)
+
+        assert result["mode"] == "refire"
+        assert result["ok"] is True
+        assert _final_health(deps)["runs_since_browser"] == 1
+
+    def test_browser_run_when_counter_reaches_n(self, deps, monkeypatch):
+        self._wire_refire(deps, monkeypatch,
+                          refire_quotes=[PriceQuote(FLIGHT_ID_1, 450)])
+        deps.state.load_health.return_value = {"runs_since_browser": 2}
+
+        result = run_and_report(deps)
+
+        assert result["mode"] == "browser"
+        assert _final_health(deps)["runs_since_browser"] == 0
+        deps.state.save_refire.assert_called_once()  # fresh state saved
+
+    def test_empty_refire_falls_back_to_browser_same_run(self, deps, monkeypatch):
+        self._wire_refire(deps, monkeypatch, refire_quotes=[])
+
+        result = run_and_report(deps)
+
+        assert result["mode"] == "browser"
+        assert result["ok"] is True
+        assert result["flights"] == 1
+
+    def test_stale_refire_state_forces_browser(self, deps, monkeypatch):
+        self._wire_refire(deps, monkeypatch,
+                          refire_quotes=[PriceQuote(FLIGHT_ID_1, 450)])
+        deps.state.load_refire.return_value = {
+            "saved_at": _time.time() - 60 * 60,  # 1h old
+            "captured": [{"url": "saved-req"}], "headers": {},
+        }
+
+        result = run_and_report(deps)
+
+        assert result["mode"] == "browser"
+
+    def test_refire_run_never_prunes(self, deps, monkeypatch):
+        """Refire runs have no page metadata — a flight one miss from
+        pruning must survive them untouched."""
+        self._wire_refire(deps, monkeypatch,
+                          refire_quotes=[PriceQuote(FLIGHT_ID_1, 450)])
+        stale_id = "id_" + "e" * 32
+        deps.state.load_manifest.return_value = {
+            stale_id: {"origin": "SFO", "missing_runs": 1},
+        }
+
+        result = run_and_report(deps)
+
+        assert result["removed"] == 0
+        manifest = deps.state.save_manifest.call_args[0][0]
+        assert manifest[stale_id]["missing_runs"] == 1

@@ -216,9 +216,10 @@ resource "aws_lambda_function" "tracker" {
 
   environment {
     variables = {
-      S3_BUCKET      = aws_s3_bucket.profile.bucket
-      DYNAMODB_TABLE = aws_dynamodb_table.prices.name
-      HYDRATE_SECS   = "45"
+      S3_BUCKET       = aws_s3_bucket.profile.bucket
+      DYNAMODB_TABLE  = aws_dynamodb_table.prices.name
+      HYDRATE_SECS    = "45"
+      BROWSER_EVERY_N = tostring(var.browser_every_n)
 
       GOOGLE_EMAIL       = var.google_email
       GOOGLE_PASSWORD    = var.google_password

@@ -29,6 +29,7 @@ class RunSummary:
     runtime_secs: float = 0.0
     finished_at: str = ""
     error: str = ""
+    mode: str = "browser"  # "browser" | "refire" (Chrome-less run)
 
     def to_dict(self) -> dict:
         return {
@@ -39,6 +40,7 @@ class RunSummary:
             "runtime_secs": round(self.runtime_secs, 1),
             "finished_at": self.finished_at,
             "error": self.error,
+            "mode": self.mode,
         }
 
     @classmethod
@@ -53,6 +55,7 @@ class RunSummary:
             runtime_secs=float(data.get("runtime_secs", 0.0)),
             finished_at=str(data.get("finished_at", data.get("ts", ""))),
             error=str(data.get("error", "")),
+            mode=str(data.get("mode", "browser")),
         )
 
 

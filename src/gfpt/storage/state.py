@@ -6,6 +6,7 @@ objects. Keys are kept identical to the previous version so a redeploy
 picks up existing state with no migration:
 
   sessions/latest.json   Google session cookies (+ saved_at timestamp)
+  state/refire.json      captured price requests + headers for Chrome-less runs
   flights/manifest.json  every tracked flight: metadata, price, missing_runs
   status/last_run.json   last RunSummary, for /status
   state/users.json       per-user preferences (muted, ...)
@@ -34,6 +35,7 @@ _MISSING_KEY_CODES = {"NoSuchKey", "NoSuchBucket", "404"}
 _AMBIGUOUS_CODES = {"AccessDenied", "403"}
 
 _SESSION_KEY = "sessions/latest.json"
+_REFIRE_KEY = "state/refire.json"
 _MANIFEST_KEY = "flights/manifest.json"
 _SUMMARY_KEY = "status/last_run.json"
 _USER_PREFS_KEY = "state/users.json"
@@ -92,6 +94,17 @@ class StateStore:
 
     def save_session(self, payload: dict) -> bool:
         return self._put_json(_SESSION_KEY, payload)
+
+    # ── Refire state (Chrome-less runs) ────────────────────────────────────────
+    # Shape: {"saved_at": epoch float, "captured": [request dicts],
+    #         "headers": {header: value}} — same sensitivity as the session
+    # file (headers carry the Cookie), same private bucket.
+
+    def load_refire(self) -> dict | None:
+        return self._get_json(_REFIRE_KEY, None)
+
+    def save_refire(self, payload: dict) -> bool:
+        return self._put_json(_REFIRE_KEY, payload)
 
     # ── Flights manifest ───────────────────────────────────────────────────────
     # Shape: {flight_id: {<metadata fields>, "price": int, "search_url": str,
