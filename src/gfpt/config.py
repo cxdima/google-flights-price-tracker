@@ -21,11 +21,14 @@ log = logging.getLogger(__name__)
 
 FLIGHTS_SAVES_URL = "https://www.google.com/travel/flights/saves"
 
-# User-agent: current stable Windows Chrome — blends into real traffic
+# User-agent: Windows Chrome matching the MAJOR version of the chromium
+# pinned in the Dockerfile (146.x). A UA that lags the real engine is a
+# fingerprint mismatch Google's page JS can see — keep the two in sync
+# whenever the chromium pin moves.
 CHROME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/136.0.0.0 Safari/537.36"
+    "Chrome/146.0.0.0 Safari/537.36"
 )
 
 # Maximum age of a cached Google session before we force a fresh login
@@ -33,9 +36,12 @@ SESSION_MAX_AGE_SECS = 6 * 60 * 60
 
 # Maximum age of saved refire state (captured requests + session headers)
 # before a Chrome-less run refuses it and falls back to the browser.
-# Measured 2026-07-10: refires were VALID at +15 min but DEAD at +30 min
-# (Google rejects the token/cookies), so N=2 is the ceiling on a 15-min
-# schedule; 25 min covers schedule jitter without trusting dead tokens.
+# The 2026-07-10 "DEAD at +30 min" measurement was later traced to Google's
+# bot defense intermittently rejecting ANY plain-Python re-fire from AWS
+# egress IPs (~35% per attempt, age-independent) — a 35-min-old token
+# re-fired fine from a residential IP on 2026-07-14. 25 min stays as a
+# conservative cap: cookies do rotate, and stale-state runs have a browser
+# fallback anyway.
 REFIRE_MAX_AGE_SECS = 25 * 60
 
 # A flight must be absent from this many consecutive runs before it is

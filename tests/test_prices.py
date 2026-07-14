@@ -1,5 +1,8 @@
 """Unit tests for gfpt.tracking.prices — response parsing, no network."""
 import json
+import urllib.request
+
+import pytest
 
 from conftest import FLIGHT_ID_1, FLIGHT_ID_2, FLIGHT_ID_SHORT, SEARCH_URL_1
 from gfpt.models import PriceQuote
@@ -8,6 +11,7 @@ from gfpt.tracking.prices import (
     _find_price,
     _find_search_url,
     extract_params,
+    fetch_prices,
     parse_prices,
 )
 
@@ -244,3 +248,89 @@ class TestFindSearchUrl:
 
     def test_returns_none_for_integer(self):
         assert _find_search_url(12345) is None
+
+
+# ── fetch_prices retry behaviour ───────────────────────────────────────────────
+# Google's bot defense tarpits ~35% of re-fires from AWS egress IPs
+# (per-attempt random) — a retry on a fresh connection re-rolls the dice.
+
+def _refire_params() -> dict:
+    return {
+        "base_url": "https://www.google.com/batchexecute",
+        "f_sid": "1", "bl": "b", "hl": "en", "gl": "US",
+        "soc_app": "162", "soc_platform": "1", "soc_device": "1",
+        "_reqid": "1", "rt": "c", "at": "tok", "f_req": "[]",
+    }
+
+
+class _FakeResponse:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def read(self) -> bytes:
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class TestFetchPricesRetries:
+    def test_retries_after_timeout_and_returns_second_response(self, monkeypatch):
+        calls = []
+
+        def fake_urlopen(req, timeout):
+            calls.append(timeout)
+            if len(calls) == 1:
+                raise TimeoutError("The read operation timed out")
+            return _FakeResponse(b"payload")
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+        assert fetch_prices(_refire_params(), {}, attempts=3) == b"payload"
+        assert len(calls) == 2
+
+    def test_single_attempt_by_default(self, monkeypatch):
+        calls = []
+
+        def fake_urlopen(req, timeout):
+            calls.append(1)
+            raise TimeoutError("The read operation timed out")
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+        with pytest.raises(TimeoutError):
+            fetch_prices(_refire_params(), {})
+        assert len(calls) == 1
+
+    def test_raises_last_error_after_exhausting_attempts(self, monkeypatch):
+        calls = []
+
+        def fake_urlopen(req, timeout):
+            calls.append(1)
+            raise TimeoutError("The read operation timed out")
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+        with pytest.raises(TimeoutError):
+            fetch_prices(_refire_params(), {}, attempts=3)
+        assert len(calls) == 3
+
+    def test_retries_stop_when_deadline_passed(self, monkeypatch):
+        """The retry budget is wall-clock shared across a batch — a past
+        deadline means the first attempt still runs, but no retries."""
+        calls = []
+
+        def fake_urlopen(req, timeout):
+            calls.append(1)
+            raise TimeoutError("The read operation timed out")
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        import time as _time
+
+        with pytest.raises(TimeoutError):
+            fetch_prices(_refire_params(), {}, attempts=3,
+                         deadline=_time.monotonic() - 1)
+        assert len(calls) == 1

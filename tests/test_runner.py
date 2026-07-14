@@ -37,20 +37,26 @@ def deps():
     )
 
 
-def _wire_success(monkeypatch, quotes=None, meta=None, refire_failures=0):
-    """Make the browser phase and quote fetching succeed deterministically."""
+def _wire_success(monkeypatch, quotes=None, meta=None, refire_failures=0, bodies=None):
+    """Make the browser phase and quote fetching succeed deterministically.
+
+    bodies defaults to empty so quotes flow through the re-fire path; pass
+    CDP bodies to exercise the in-browser-response path instead.
+    """
     if quotes is None:
         quotes = [PriceQuote(FLIGHT_ID_1, 450, SEARCH_URL_1)]
     if meta is None:
         meta = {FLIGHT_ID_1: {"origin": "ORD", "destination": "LAX"}}
     monkeypatch.setattr(
         runner_mod, "_browser_phase",
-        lambda settings, state: ([{"url": "captured"}], "<html/>", {"Cookie": "x"}),
+        lambda settings, state: (
+            [{"url": "captured"}], bodies or [], "<html/>", {"Cookie": "x"},
+        ),
     )
     monkeypatch.setattr(runner_mod, "extract_flight_metadata", lambda html: meta)
     monkeypatch.setattr(
         runner_mod, "_fetch_quotes",
-        lambda captured, headers: (quotes, refire_failures),
+        lambda captured, headers, attempts=1: (quotes, refire_failures),
     )
 
 
@@ -454,6 +460,104 @@ class TestReboundDamping:
         deps.notifier.price_alert.assert_not_called()  # unchanged: no alert
 
 
+# ── In-browser response bodies (CDP) ───────────────────────────────────────────
+
+class TestInBrowserBodies:
+    """Browser runs must parse the responses Chrome itself received —
+    re-firing from plain Python is what Google's bot defense rejects
+    ~35% of the time on AWS egress IPs."""
+
+    def _wire_bodies(self, monkeypatch, bodies):
+        monkeypatch.setattr(
+            runner_mod, "_browser_phase",
+            lambda settings, state: (
+                [{"url": "captured"}], bodies, "<html/>", {"Cookie": "x"},
+            ),
+        )
+        monkeypatch.setattr(
+            runner_mod, "extract_flight_metadata",
+            lambda html: {FLIGHT_ID_1: {"origin": "ORD"}},
+        )
+
+    def test_bodies_parsed_without_any_refire(
+        self, deps, monkeypatch, sample_price_body
+    ):
+        self._wire_bodies(monkeypatch, [sample_price_body])
+        monkeypatch.setattr(
+            runner_mod, "_fetch_quotes",
+            lambda *a, **kw: pytest.fail("must not re-fire when bodies parse"),
+        )
+
+        result = run_and_report(deps)
+
+        assert result["ok"] is True
+        assert result["flights"] == 2  # both flights in sample_price_body
+
+    def test_unparseable_bodies_fall_back_to_refire_with_retries(
+        self, deps, monkeypatch
+    ):
+        self._wire_bodies(monkeypatch, [b"not a wrb.fr payload"])
+        seen = {}
+
+        def fetch(captured, headers, attempts=1):
+            seen["attempts"] = attempts
+            return [PriceQuote(FLIGHT_ID_1, 450, SEARCH_URL_1)], 0
+
+        monkeypatch.setattr(runner_mod, "_fetch_quotes", fetch)
+
+        result = run_and_report(deps)
+
+        assert result["ok"] is True
+        assert seen["attempts"] == runner_mod._BROWSER_REFIRE_ATTEMPTS
+
+    def test_no_bodies_falls_back_to_refire(self, deps, monkeypatch):
+        self._wire_bodies(monkeypatch, [])
+        monkeypatch.setattr(
+            runner_mod, "_fetch_quotes",
+            lambda captured, headers, attempts=1: (
+                [PriceQuote(FLIGHT_ID_1, 450, SEARCH_URL_1)], 0,
+            ),
+        )
+
+        result = run_and_report(deps)
+
+        assert result["ok"] is True
+        assert result["flights"] == 1
+
+    def test_missing_body_refires_only_that_request(
+        self, deps, monkeypatch, sample_price_body
+    ):
+        """Two captured requests, one body evicted (None): the run must
+        keep the parsed body's quotes AND re-fire exactly the evicted
+        request — not silently drop its flights, not re-fire everything."""
+        monkeypatch.setattr(
+            runner_mod, "_browser_phase",
+            lambda settings, state: (
+                [{"url": "req-ok"}, {"url": "req-evicted"}],
+                [sample_price_body, None],
+                "<html/>", {"Cookie": "x"},
+            ),
+        )
+        monkeypatch.setattr(
+            runner_mod, "extract_flight_metadata",
+            lambda html: {FLIGHT_ID_1: {"origin": "ORD"}},
+        )
+        refired = {}
+        extra_id = "id_" + "c" * 32
+
+        def fetch(captured, headers, attempts=1):
+            refired["urls"] = [r["url"] for r in captured]
+            return [PriceQuote(extra_id, 199)], 0
+
+        monkeypatch.setattr(runner_mod, "_fetch_quotes", fetch)
+
+        result = run_and_report(deps)
+
+        assert result["ok"] is True
+        assert refired["urls"] == ["req-evicted"]
+        assert result["flights"] == 3  # 2 from the body + 1 re-fired
+
+
 # ── Refire mode (BROWSER_EVERY_N) ──────────────────────────────────────────────
 
 import time as _time  # noqa: E402
@@ -473,12 +577,14 @@ class TestRefireMode:
         browser_quotes = browser_quotes or [PriceQuote(FLIGHT_ID_1, 450, SEARCH_URL_1)]
         monkeypatch.setattr(
             runner_mod, "_browser_phase",
-            lambda settings, state: ([{"url": "browser-req"}], "<html/>", {"Cookie": "y"}),
+            lambda settings, state: (
+                [{"url": "browser-req"}], [], "<html/>", {"Cookie": "y"},
+            ),
         )
         monkeypatch.setattr(runner_mod, "extract_flight_metadata",
                             lambda html: {FLIGHT_ID_1: {"origin": "ORD"}})
 
-        def fetch(captured, headers):
+        def fetch(captured, headers, attempts=1):
             if captured and captured[0].get("url") == "saved-req":
                 return refire_quotes, 0
             return browser_quotes, 0

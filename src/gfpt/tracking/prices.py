@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 import urllib.parse
 import urllib.request
 
@@ -53,10 +54,22 @@ def extract_params(captured: dict) -> dict:
     }
 
 
-def fetch_prices(params: dict, headers: dict) -> bytes:
+def fetch_prices(
+    params: dict,
+    headers: dict,
+    attempts: int = 1,
+    deadline: float | None = None,
+) -> bytes:
     """
     Re-fire a single GetSolutionPrices POST with pre-built HTTP headers.
     Pure stdlib — no Selenium dependency, safe to call from threads.
+
+    Google's bot defense intermittently tarpits these requests from AWS
+    egress IPs (>20s stall) — measured per-attempt-random, so a retry on a
+    fresh connection re-rolls the dice. Each attempt gets its own 20s read
+    timeout; the last failure propagates. The first attempt always runs;
+    retries stop once time.monotonic() passes `deadline` (a shared
+    wall-clock budget when many requests run through one thread pool).
     """
     query = urllib.parse.urlencode({
         "f.sid":        params["f_sid"],
@@ -74,9 +87,23 @@ def fetch_prices(params: dict, headers: dict) -> bytes:
         "f.req": params["f_req"],
         "at":    params["at"],
     }).encode()
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return resp.read()
+
+    last_exc: Exception | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return resp.read()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < attempts:
+                if deadline is not None and time.monotonic() >= deadline:
+                    log.warning("GetSolutionPrices attempt %d/%d failed (%s) — "
+                                "retry budget exhausted", attempt, attempts, exc)
+                    break
+                log.warning("GetSolutionPrices attempt %d/%d failed (%s) — retrying",
+                            attempt, attempts, exc)
+    raise last_exc
 
 
 # ── Response parsing ───────────────────────────────────────────────────────────

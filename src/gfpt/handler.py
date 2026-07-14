@@ -31,9 +31,13 @@ from gfpt.storage.dynamo import PriceHistory
 from gfpt.storage.state import StateStore
 from gfpt.tracking.runner import TrackerDeps, run_and_report
 
+# force=True: the Lambda runtime pre-installs a root handler, which makes a
+# plain basicConfig() a silent no-op — INFO lines (GFPT_SUMMARY, capture and
+# re-fire diagnostics) never reached CloudWatch without it.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    force=True,
 )
 log = logging.getLogger(__name__)
 

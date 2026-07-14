@@ -59,6 +59,20 @@ _BLOCKED_URLS = [
 
 _MAX_REFIRE_WORKERS = 4
 
+# Re-fire attempts for the post-browser fallback. This path has no further
+# fallback — a failure fails the whole run — and Google's tarpitting is
+# per-attempt random (~35% from AWS IPs), so retries re-roll the dice.
+# Refire-only runs keep a single attempt: their fallback is a full browser
+# run, and the Lambda timeout budget must fit both.
+_BROWSER_REFIRE_ATTEMPTS = 3
+
+# Wall-clock budget for the whole retry phase of a fallback batch. Retries
+# beyond attempt 1 stop once this is exhausted, so many captured requests
+# queuing behind _MAX_REFIRE_WORKERS cannot multiply into ceil(N/4)×60s and
+# blow the 120s Lambda timeout (browser phase ~10-30s + first attempts
+# ~20s×ceil(N/4) + this budget must fit).
+_REFIRE_RETRY_BUDGET_SECS = 45
+
 
 @dataclass(frozen=True)
 class TrackerDeps:
@@ -158,15 +172,38 @@ def _run(deps: TrackerDeps, t0: float, health: dict) -> RunSummary:
             log.warning("Refire-only run got no quotes — falling back to browser")
 
     if not quotes:
-        captured, page_html, headers = _browser_phase(deps.settings, deps.state)
+        captured, bodies, page_html, headers = _browser_phase(deps.settings, deps.state)
         log.info("Chrome released at %.1fs", time.monotonic() - t0)
 
         flight_meta = extract_flight_metadata(page_html)
         del page_html  # free the multi-MB HTML string
 
-        quotes, refire_failures = _fetch_quotes(captured, headers)
-        log.info("Parsed %d price quote(s) from %d request(s), %d re-fire failure(s)",
-                 len(quotes), len(captured), refire_failures)
+        # Prefer the responses Chrome itself received: no second round-trip
+        # for Google's bot defense to reject. Re-fire ONLY the requests whose
+        # body was unavailable or parsed to nothing — a single evicted body
+        # must not silently drop its flights from the run.
+        padded = list(bodies) + [None] * (len(captured) - len(bodies))
+        batches = [
+            parse_prices(body) if body is not None else None
+            for body in padded
+        ]
+        body_quotes = [b for b in batches if b]
+        needs_refire = [
+            req for req, batch in zip(captured, batches, strict=True)
+            if not batch
+        ]
+        refire_quotes: list[PriceQuote] = []
+        if needs_refire:
+            log.warning("%d of %d captured request(s) had no usable in-browser "
+                        "body — re-firing those", len(needs_refire), len(captured))
+            refire_quotes, refire_failures = _fetch_quotes(
+                needs_refire, headers, attempts=_BROWSER_REFIRE_ATTEMPTS,
+            )
+        quotes = _merge_lowest([*body_quotes, refire_quotes])
+        log.info("Parsed %d price quote(s): %d request(s) via in-browser bodies, "
+                 "%d re-fired, %d re-fire failure(s)",
+                 len(quotes), len(captured) - len(needs_refire),
+                 len(needs_refire), refire_failures)
         if not quotes:
             raise RuntimeError("No price quotes parsed from captured requests")
         deps.state.save_refire({
@@ -243,7 +280,9 @@ def _usable_refire_state(deps: TrackerDeps, health: dict) -> dict | None:
 
 # ── Phase 1: browser ───────────────────────────────────────────────────────────
 
-def _browser_phase(settings: Settings, state: StateStore) -> tuple[list, str, dict]:
+def _browser_phase(
+    settings: Settings, state: StateStore,
+) -> tuple[list, list[bytes], str, dict]:
     nuke_chrome()
     driver = build_driver(settings)
     try:
@@ -255,13 +294,13 @@ def _browser_phase(settings: Settings, state: StateStore) -> tuple[list, str, di
         # Session restore already landed on the saves page with CDP running —
         # don't reload, the price requests we need may already be in the log.
         on_saves = "google.com/travel/flights/saves" in driver.current_url
-        captured, page_html = intercept_api_call(
+        captured, bodies, page_html = intercept_api_call(
             driver, settings.hydrate_secs, skip_nav=on_saves,
         )
 
         headers = build_session_headers(driver)
         save_session(driver, state)
-        return captured, page_html, headers
+        return captured, bodies, page_html, headers
     finally:
         quit_quietly(driver)  # frees ~800 MB before phase 2
         cleanup_profiles()
@@ -269,16 +308,38 @@ def _browser_phase(settings: Settings, state: StateStore) -> tuple[list, str, di
 
 # ── Phase 2: pure Python ───────────────────────────────────────────────────────
 
-def _fetch_quotes(captured: list[dict], headers: dict) -> tuple[list[PriceQuote], int]:
-    """Re-fire all captured requests concurrently; merge to the lowest
-    price per flight. Returns (quotes, number_of_failed_refires)."""
+def _merge_lowest(batches) -> list[PriceQuote]:
+    """Merge iterables of quotes to the lowest price per flight, sorted
+    ascending by price."""
     best: dict[str, PriceQuote] = {}
+    for batch in batches:
+        for quote in batch:
+            existing = best.get(quote.flight_id)
+            if existing is None or quote.price < existing.price:
+                best[quote.flight_id] = quote
+    return sorted(best.values(), key=lambda q: q.price)
+
+
+def _fetch_quotes(
+    captured: list[dict], headers: dict, attempts: int = 1,
+) -> tuple[list[PriceQuote], int]:
+    """Re-fire all captured requests concurrently; merge to the lowest
+    price per flight. Returns (quotes, number_of_failed_refires).
+
+    Retries share one wall-clock budget across the whole batch so queued
+    requests cannot multiply the worst case past the Lambda timeout."""
+    batches: list[list[PriceQuote]] = []
     failures = 0
     workers = min(len(captured), _MAX_REFIRE_WORKERS)
+    deadline = (
+        time.monotonic() + _REFIRE_RETRY_BUDGET_SECS if attempts > 1 else None
+    )
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(fetch_prices, extract_params(req), headers): i
+            pool.submit(
+                fetch_prices, extract_params(req), headers, attempts, deadline,
+            ): i
             for i, req in enumerate(captured)
         }
         for future in as_completed(futures):
@@ -291,12 +352,14 @@ def _fetch_quotes(captured: list[dict], headers: dict) -> tuple[list[PriceQuote]
                 continue
             batch = parse_prices(raw)
             log.info("Re-fire #%d: %d bytes → %d flight(s)", idx, len(raw), len(batch))
-            for quote in batch:
-                existing = best.get(quote.flight_id)
-                if existing is None or quote.price < existing.price:
-                    best[quote.flight_id] = quote
+            if not batch:
+                # The rejection payload was invisible for months — keep a
+                # snippet so the next investigation starts with evidence.
+                log.warning("Re-fire #%d: %d bytes parsed to 0 quotes; head=%r",
+                            idx, len(raw), raw[:200])
+            batches.append(batch)
 
-    return sorted(best.values(), key=lambda q: q.price), failures
+    return _merge_lowest(batches), failures
 
 
 def _process_quotes(
