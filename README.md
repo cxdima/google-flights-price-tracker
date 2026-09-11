@@ -160,11 +160,13 @@ Note: 15 minutes keeps Lambda comfortably inside the free tier; a 10-minute sche
 | Tool | Version |
 |---|---|
 | Python | 3.11+ |
-| Terraform | 1.5+ |
+| Terraform | 1.10+ (native S3 state locking) |
 | Docker | with buildx |
 | AWS CLI | v2 |
 
-AWS credentials must be configured (`aws configure` or environment variables) with permissions to manage Lambda, ECR, S3, DynamoDB, IAM, EventBridge, and CloudWatch Logs. Secrets are passed to the Lambda directly as Terraform variables from `.env` — no Parameter Store or Secrets Manager involved.
+AWS credentials must be configured (`aws configure` or environment variables) with permissions to manage Lambda, ECR, S3, DynamoDB, IAM, EventBridge, SSM Parameter Store, and CloudWatch Logs.
+
+At **deploy** time secrets are passed to the Lambda directly as Terraform variables from `.env` — nothing reads Parameter Store at runtime. Parameter Store is used only as the durable backup of `.env` so the project can be rebuilt on a new machine; see [Disaster recovery](#disaster-recovery).
 
 ---
 
@@ -266,5 +268,66 @@ All AWS resources are managed by Terraform in `infra/`.
 | Lambda Function URL | Public (Telegram must reach it); auth enforced in the handler via the webhook secret token |
 | S3 bucket | Session cookies, flight manifest, run state, crash screenshots; versioned with lifecycle expiry |
 | DynamoDB table | Price history keyed by `flight_id + ts`, on-demand billing, 1-year TTL |
+| S3 state bucket | `gfpricetracker-terraform-state` — Terraform remote state; private, versioned, SSE-S3, TLS-only. Created out of band, **not** managed by this Terraform |
+| SSM parameters | `/gfpricetracker/*` — durable backup of `.env`; secrets `SecureString`, config `String` |
 | CloudWatch log group | Explicitly declared with 14-day retention |
 | IAM | Least-privilege: `GetObject/PutObject/HeadObject` on the bucket, `PutItem/GetItem/Query` on the table |
+
+---
+
+## Disaster recovery
+
+Nothing that matters lives only on a developer laptop. The repo holds the code;
+AWS holds the state and the secrets.
+
+| What | Where it lives | Notes |
+|---|---|---|
+| Code | GitHub (private) | |
+| Terraform state | `s3://gfpricetracker-terraform-state/gfpricetracker/terraform.tfstate` | Versioned; 20 most recent non-current versions kept for 90 days |
+| Secrets & config | SSM Parameter Store, `/gfpricetracker/*` | Secrets `SecureString` on the AWS-managed `alias/aws/ssm` key; config `String` |
+
+### Rebuilding on a new machine
+
+```bash
+git clone git@github.com:cxdima/google-flights-price-tracker.git
+cd google-flights-price-tracker
+aws configure                    # or your MFA session helper
+bash scripts/restore_env.sh      # rebuilds .env from SSM
+make deploy
+```
+
+`terraform init` picks the state up from S3 automatically — there is no local
+state file to carry across and nothing to import.
+
+### After changing a secret
+
+`.env` is the source of truth at deploy time; SSM is the backup. If you change a
+value in `.env`, mirror it so the backup does not silently drift:
+
+```bash
+aws ssm put-parameter --name /gfpricetracker/TELEGRAM_BOT_TOKEN \
+  --value "$NEW_VALUE" --type SecureString --overwrite
+```
+
+### Bootstrapping from scratch
+
+Only needed if the state bucket itself is ever lost. Terraform cannot manage the
+bucket that stores its own state, so it is created out of band:
+
+```bash
+B=gfpricetracker-terraform-state
+aws s3api create-bucket --bucket "$B" --region us-east-1
+aws s3api put-public-access-block --bucket "$B" \
+  --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+aws s3api put-bucket-versioning --bucket "$B" \
+  --versioning-configuration Status=Enabled
+aws s3api put-bucket-encryption --bucket "$B" \
+  --server-side-encryption-configuration \
+  '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+```
+
+> **State contains secrets.** Terraform records the Lambda environment block
+> verbatim, so `GOOGLE_PASSWORD`, `TOTP_SECRET` and `TELEGRAM_BOT_TOKEN` sit in
+> plaintext inside the state file. Keep the bucket private, encrypted and
+> TLS-only, and never copy state into the repo or a public location.

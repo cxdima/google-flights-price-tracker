@@ -1,5 +1,23 @@
 terraform {
-  required_version = ">= 1.5.0"
+  required_version = ">= 1.10.0"
+
+  # State lives in S3 so it survives this laptop. The bucket is created out of
+  # band (see README "Bootstrapping from scratch") because Terraform can't
+  # manage the bucket that holds its own state.
+  #
+  # NOTE: state contains the Lambda env block, i.e. GOOGLE_PASSWORD, TOTP_SECRET
+  # and TELEGRAM_BOT_TOKEN in plaintext. The bucket is private, versioned,
+  # SSE-S3 encrypted and TLS-only. Do not relax any of that.
+  #
+  # use_lockfile: native S3 locking (TF >= 1.10) — no DynamoDB lock table.
+  backend "s3" {
+    bucket       = "gfpricetracker-terraform-state"
+    key          = "gfpricetracker/terraform.tfstate"
+    region       = "us-east-1"
+    encrypt      = true
+    use_lockfile = true
+  }
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
